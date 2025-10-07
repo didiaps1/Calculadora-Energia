@@ -6,12 +6,20 @@ const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 // login anônimo (gera um user_id por navegador)
 let currentUser = null;
 async function ensureAuth() {
-  const { data: { user } } = await sb.auth.getUser();
-  if (user) { currentUser = user; return user; }
-  const { data, error } = await sb.auth.signInAnonymously();
-  if (error) { console.error(error); alert('Falha ao autenticar'); throw error; }
-  currentUser = data.user;
-  return currentUser;
+  try {
+    const { data: { user } } = await sb.auth.getUser();
+    if (user) { currentUser = user; return user; }
+
+    const { data, error } = await sb.auth.signInAnonymously();
+    if (error) throw error;
+
+    currentUser = data.user;
+    return currentUser;
+  } catch (error) {
+    console.error('Supabase auth error:', error);
+    alert('Falha ao autenticar: ' + (error.message || error.error_description || 'ver console'));
+    throw error;
+  }
 }
 
 /* ==========================
@@ -435,4 +443,5 @@ deleteAccountBtn.addEventListener('click', async ()=>{
   await refreshAccountSelect();
   accountSelect.value = '';
   alert('Conta excluída.');
+
 });
