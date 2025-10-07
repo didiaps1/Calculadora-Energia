@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Calculadora de Energia - SCEE</title>
+  <link rel="stylesheet" href="assets/css/styles.css" />
+</head>
+<body>
+  <div class="wrap">
+    <div class="shell">
+      <!-- Coluna esquerda -->
+      <section class="card" id="formCard">
+        <h1>Calculadora de Energia • SCEE</h1>
+        <p class="sub">Informe a injeção e o preço unitário. Selecione o desconto e gere o pagamento.</p>
+
+        <div class="grid">
+          <div>
+            <label class="lbl" for="inj">INJEÇÃO SCEE (kWh)</label>
+            <div class="field">
+              <input id="inj" class="inp" type="text" inputmode="decimal" placeholder="Ex: 1.250,75 ou 1250.75" autocomplete="off">
+              <span class="suffix">kWh</span>
+            </div>
+          </div>
+
+          <div>
+            <label class="lbl" for="unit">Preço unit R$ com Tributos</label>
+            <div class="field">
+              <input id="unit" class="inp" type="text" inputmode="decimal" placeholder="Ex: 0,89 ou 0.89" autocomplete="off">
+              <span class="suffix">R$/kWh</span>
+            </div>
+          </div>
+
+          <div>
+            <label class="lbl">Desconto a conceder</label>
+            <div class="row" id="discountRow" aria-label="Opções de desconto">
+              <label class="chip"><input type="radio" name="pct" value="5"><span class="dot"></span>5%</label>
+              <label class="chip"><input type="radio" name="pct" value="10"><span class="dot"></span>10%</label>
+              <label class="chip"><input type="radio" name="pct" value="15"><span class="dot"></span>15%</label>
+              <label class="chip"><input type="radio" name="pct" value="20"><span class="dot"></span>20%</label>
+              <label class="chip"><input type="radio" name="pct" value="25"><span class="dot"></span>25%</label>
+              <label class="chip"><input type="radio" name="pct" value="35"><span class="dot"></span>35%</label>
+              <label class="chip" id="chipCustom">
+                <input type="radio" name="pct" value="custom">
+                <span class="dot"></span>
+                <span class="customWrap">
+                  <span class="muted">Personalizar</span>
+                  <input id="customPct" type="number" min="0" max="100" step="0.1" placeholder="0,0" disabled>
+                  <span class="pctSuffix">%</span>
+                </span>
+              </label>
+            </div>
+
+            <div class="actions">
+              <button id="toggleDiscountsBtn" class="btn ghost hidden" type="button">Alterar desconto</button>
+            </div>
+          </div>
+
+          <div class="actions">
+            <button id="calcBtn" class="btn" type="button">Calcular</button>
+            <button id="clearBtn" class="btn outline" type="button">Limpar</button>
+          </div>
+
+          <span id="err" class="error">Preencha INJEÇÃO e Preço unitário com números válidos. O desconto deve estar entre 0% e 100%.</span>
+
+          <div id="res" class="result" hidden>
+            <div class="rows">
+              <div class="r"><span class="k">Valor base</span><span class="v" id="vBase">R$ 0,00</span></div>
+              <div class="r"><span class="k">Desconto aplicado</span><span class="v" id="vPct">0%</span></div>
+              <div class="r"><span class="k">Valor do desconto</span><span class="v" id="vDesc">R$ 0,00</span></div>
+              <div class="r total">
+                <span class="k">Valor a receber</span>
+                <span class="v" id="vFinal">R$ 0,00</span>
+              </div>
+            </div>
+            <div class="actions" style="margin-top:6px">
+              <button class="btn" id="copyBtn" type="button">Copiar valor final</button>
+              <span class="badge" id="copied" hidden>Copiado</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Coluna direita -->
+      <section class="card">
+        <h1>Resumo rápido</h1>
+        <div class="rows">
+          <div class="r"><span class="k">Injeção informada</span><span class="v" id="sInj">—</span></div>
+          <div class="r"><span class="k">Preço unit c/ tributos</span><span class="v" id="sUnit">—</span></div>
+          <div class="r"><span class="k">Desconto escolhido</span><span class="v" id="sPct">—</span></div>
+        </div>
+
+        <div class="result" style="margin-top:14px">
+          <div class="r total">
+            <span class="k">Cliente deve pagar</span>
+            <span class="v" id="sFinal" style="font-size:22px">R$ 0,00</span>
+          </div>
+
+          <div class="actions" style="margin-top:10px">
+            <button id="payBtn" class="btn" type="button">Gerar Pagamento</button>
+            <button id="downloadBtn" class="btn outline" type="button">Download (PDF)</button>
+          </div>
+
+          <!-- QR exibido aqui -->
+          <div id="qrArea" class="qrWrap hidden">
+            <div class="qrBox">
+              <div id="qrcode" class="qrCanvas"></div>
+              <div style="min-width:260px; max-width:380px">
+                <div class="r"><span class="k">Valor</span><span class="v" id="qrValor">R$ 0,00</span></div>
+                <div class="r"><span class="k">Chave</span><span class="v" id="qrKey">—</span></div>
+              </div>
+            </div>
+            <textarea id="qrPayload" class="inp" rows="3" readonly></textarea>
+            <div class="actions">
+              <button id="copyPayload" class="btn outline" type="button">Copiar código</button>
+              <button id="downloadQR" class="btn outline" type="button">Baixar PNG</button>
+            </div>
+          </div>
+
+          <footer>Calculadora de Energia • SCEE • v1.3</footer>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- Modal PIX -->
+  <div id="overlay" class="overlay" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal">
+      <h2 id="modalTitle">Gerar pagamento PIX</h2>
+
+      <div class="grid">
+        <div>
+          <label class="lbl" for="pixKeyType">Tipo de chave</label>
+          <select id="pixKeyType" class="inp">
+            <option value="CPF">CPF</option>
+            <option value="CNPJ">CNPJ</option>
+            <option value="Telefone">Telefone</option>
+            <option value="Email">E-mail</option>
+            <option value="Aleatoria">Chave aleatória</option>
+          </select>
+        </div>
+        <div>
+          <label class="lbl" for="pixKey">Chave Pix</label>
+          <input id="pixKey" class="inp" type="text" placeholder="Digite a chave">
+        </div>
+        <div>
+          <label class="lbl" for="pixAmount">Valor (BRL)</label>
+          <input id="pixAmount" class="inp" type="text" inputmode="decimal" placeholder="Ex: 150,00">
+        </div>
+
+        <div class="full">
+          <button id="advBtn" class="btn ghost" type="button">Opções avançadas</button>
+        </div>
+
+        <div id="advFields" class="full hidden">
+          <div class="grid">
+            <div>
+              <label class="lbl" for="pixName">Nome do recebedor</label>
+              <input id="pixName" class="inp" type="text" maxlength="25" placeholder="Opcional">
+            </div>
+            <div>
+              <label class="lbl" for="pixCity">Cidade</label>
+              <input id="pixCity" class="inp" type="text" maxlength="15" placeholder="Opcional">
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- CONTAS SALVAS (novo) -->
+      <div class="grid" style="margin-top:8px">
+        <div class="full">
+          <label class="lbl" for="accountSelect">Contas salvas</label>
+          <div class="row" style="gap:8px; align-items:stretch">
+            <select id="accountSelect" class="inp" style="flex:1; min-width:220px">
+              <option value="">— selecionar conta —</option>
+            </select>
+            <button id="useAccountBtn" class="btn outline" type="button" title="Aplicar">Usar</button>
+            <button id="saveAccountBtn" class="btn" type="button" title="Salvar">Salvar conta</button>
+            <button id="deleteAccountBtn" class="btn ghost" type="button" title="Excluir">Excluir</button>
+          </div>
+          <small class="muted">As contas ficam salvas por usuário (anônimo) no Supabase.</small>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button id="cancelModal" class="btn outline" type="button">Cancelar</button>
+        <button id="genPix" class="btn" type="button">Gerar QR Code</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== ORDEM CORRETA DE SCRIPTS ===== -->
+  <!-- 1) QRCode lib (usada no app.js) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <!-- 2) Captura e PDF (usados no app.js) -->
+  <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+  <!-- 3) Supabase SDK (usado no app.js) -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <!-- 4) Seu script principal (APENAS UMA VEZ) -->
+  <script src="assets/js/app.js"></script>
+</body>
+</html>
