@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Calculadora de Energia — SCEE</title>
+  <style>
+    :root{
+      --bg1: #0f1220;
+      --bg2: #121629;
+      --card: rgba(255,255,255,0.08);
+      --stroke: rgba(255,255,255,0.14);
+      --accent: #5dd3ff;
+      --accent-2: #86f7c2;
+      --text: #f4f6fb;
+      --muted: #c8cbe0;
+      --danger: #ff6b6b;
+      --ok: #86f7c2;
+      --radius: 14px;
+      --radius-sm: 10px;
+      --shadow: 0 8px 30px rgba(0,0,0,.35);
+      --glass: blur(10px) saturate(140%);
+    }
+    *{box-sizing: border-box}
+    html,body{height:100%}
+    body{
+      margin:0;
+      color:var(--text);
+      background: radial-gradient(1200px 900px at 20% -10%, #1b2550 0%, transparent 60%),
+                  radial-gradient(1000px 700px at 110% 30%, #153a2f 0%, transparent 55%),
+                  linear-gradient(180deg, var(--bg1), var(--bg2));
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+      letter-spacing:.2px;
+    }
+    .wrap{
+      min-height:100%;
+      display:grid;
+      place-items:center;
+      padding:32px 20px;
+    }
+    .shell{
+      width:100%;
+      max-width:980px;
+      display:grid;
+      gap:20px;
+      grid-template-columns: 1.1fr .9fr;
+    }
+    @media (max-width: 900px){
+      .shell{grid-template-columns: 1fr}
+    }
+    .card{
+      backdrop-filter: var(--glass);
+      -webkit-backdrop-filter: var(--glass);
+      background: var(--card);
+      border:1px solid var(--stroke);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding:22px;
+      position:relative;
+      overflow:hidden;
+    }
+    .card::after{
+      content:"";
+      position:absolute;
+      inset: -60% -40% auto auto;
+      height:240px; width:240px;
+      background: conic-gradient(from 0deg, var(--accent), transparent 25%, var(--accent-2), transparent 50%, var(--accent), transparent 75%, var(--accent-2));
+      opacity:.18;
+      filter: blur(30px);
+      border-radius:50%;
+      transform: translate3d(0,0,0) rotate(0deg);
+      animation: swirl 12s linear infinite;
+      pointer-events:none;
+    }
+    @keyframes swirl { to{ transform: rotate(360deg)} }
+
+    h1{
+      font-size: clamp(20px, 2.2vw, 28px);
+      margin:0 0 16px;
+      font-weight:700;
+      letter-spacing:.3px;
+    }
+    p.sub{
+      margin: -6px 0 18px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .grid{
+      display:grid;
+      gap:14px;
+    }
+    label.lbl{
+      display:block;
+      font-size:13px;
+      color:var(--muted);
+      margin-bottom:8px;
+    }
+    .field{
+      position:relative;
+    }
+    .inp{
+      width:100%;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid var(--stroke);
+      border-radius: var(--radius-sm);
+      color:var(--text);
+      padding:14px 44px 14px 14px;
+      font-size:16px;
+      outline:none;
+      transition: border-color .2s, box-shadow .2s, transform .06s;
+    }
+    .inp:focus{
+      border-color: rgba(93,211,255,.7);
+      box-shadow: 0 0 0 6px rgba(93,211,255,.12);
+    }
+    .suffix{
+      position:absolute;
+      right:10px;
+      top:50%;
+      translate: 0 -50%;
+      color:var(--muted);
+      font-size:13px;
+      padding:4px 8px;
+      border:1px dashed var(--stroke);
+      border-radius: 8px;
+      pointer-events:none;
+    }
+
+    .row{display:flex; gap:12px; align-items:center; flex-wrap:wrap}
+    .chip{
+      --chip-bg: rgba(255,255,255,0.06);
+      display:inline-flex; align-items:center; gap:8px;
+      padding:10px 12px;
+      border-radius: 999px;
+      background: var(--chip-bg);
+      border:1px solid var(--stroke);
+      cursor:pointer;
+      user-select:none;
+      transition: transform .06s, border-color .2s, background .2s, box-shadow .2s;
+    }
+    .chip:hover{ border-color: rgba(134,247,194,.7); box-shadow: 0 0 0 6px rgba(134,247,194,.10)}
+    .chip input{ display:none }
+    .chip[data-on="true"]{
+      background: linear-gradient(180deg, rgba(93,211,255,.2), rgba(134,247,194,.12));
+      border-color: rgba(93,211,255,.6);
+      box-shadow: inset 0 0 0 1px rgba(93,211,255,.35), 0 6px 18px rgba(0,0,0,.25);
+    }
+    .chip .dot{
+      width:14px; height:14px; border-radius:50%;
+      border:2px solid var(--accent);
+      display:inline-block;
+      background: transparent;
+      box-shadow: inset 0 0 0 2px rgba(13,20,40,.6);
+    }
+    .chip[data-on="true"] .dot{ background: var(--accent) }
+
+    .customWrap{
+      display:flex; align-items:center; gap:10px;
+      background: rgba(255,255,255,0.04);
+      border:1px dashed var(--stroke);
+      border-radius: 999px;
+      padding:6px 10px 6px 6px;
+    }
+    .customWrap input[type="number"]{
+      width:110px;
+      padding:8px 10px;
+      font-size:14px;
+      background: transparent;
+      border:0;
+      color:var(--text);
+      outline:none;
+    }
+    .customWrap .pctSuffix{
+      font-size:13px; color:var(--muted);
+      border-left:1px solid var(--stroke);
+      padding-left:10px;
+    }
+
+    .actions{ display:flex; gap:10px; margin-top:8px; flex-wrap:wrap }
+    .btn{
+      appearance:none; border:0; cursor:pointer;
+      padding:12px 16px;
+      border-radius:12px;
+      color:#06101a; font-weight:700;
+      background: linear-gradient(180deg, var(--accent), #47b8df);
+      box-shadow: 0 8px 20px rgba(93,211,255,.35), inset 0 -6px 18px rgba(0,0,0,.15);
+      transition: transform .06s, filter .2s, box-shadow .2s;
+    }
+    .btn:hover{ filter: brightness(1.04) }
+    .btn:active{ transform: translateY(1px) }
+    .btn.outline{
+      background: transparent;
+      color: var(--text);
+      border:1px solid var(--stroke);
+      box-shadow:none;
+    }
+
+    .result{
+      display:grid; gap:12px;
+      margin-top:10px;
+      padding:14px;
+      background: rgba(255,255,255,.05);
+      border:1px solid var(--stroke);
+      border-radius: var(--radius);
+    }
+    .rows{ display:grid; gap:8px }
+    .r{ display:flex; justify-content:space-between; align-items:center; gap:10px; }
+    .r .k{ color:var(--muted); font-size:14px }
+    .r .v{ font-variant-numeric: tabular-nums; font-weight:700 }
+    .r.total{
+      padding-top:8px; margin-top:6px;
+      border-top:1px dashed var(--stroke);
+    }
+    .badge{
+      font-size:12px; color:#0b1a13; font-weight:800;
+      background: linear-gradient(180deg, var(--accent-2), #4fe2a3);
+      padding:6px 10px; border-radius:999px;
+    }
+    .muted{ color:var(--muted) }
+
+    .error{ color: var(--danger); font-size:13px; display:none }
+    .show{ display:block }
+
+    footer{
+      margin-top:16px; text-align:center; color:var(--muted); font-size:12px;
+      opacity:.9;
+    }
+
+    /* Micro interactions */
+    .shake{ animation: shake .25s linear }
+    @keyframes shake{
+      10%, 90% { transform: translateX(-1px) }
+      20%, 80% { transform: translateX(2px) }
+      30%, 50%, 70% { transform: translateX(-4px) }
+      40%, 60% { transform: translateX(4px) }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="shell">
+      <!-- Coluna esquerda: formulário -->
+      <section class="card" id="formCard">
+        <h1>Calculadora de Energia • SCEE</h1>
+        <p class="sub">Informe a injeção (kWh) e o preço unitário com tributos para calcular o valor base. Depois escolha o desconto a conceder.</p>
+
+        <div class="grid">
+          <div>
+            <label class="lbl" for="inj">INJEÇÃO SCEE (kWh)</label>
+            <div class="field">
+              <input id="inj" class="inp" type="text" inputmode="decimal" placeholder="Ex: 1.250,75 ou 1250.75" autocomplete="off">
+              <span class="suffix">kWh</span>
+            </div>
+          </div>
+
+          <div>
+            <label class="lbl" for="unit">Preço unit R$ com Tributos</label>
+            <div class="field">
+              <input id="unit" class="inp" type="text" inputmode="decimal" placeholder="Ex: 0,89 ou 0.89" autocomplete="off">
+              <span class="suffix">R$/kWh</span>
+            </div>
+          </div>
+
+          <div>
+            <label class="lbl">Desconto a conceder</label>
+            <div class="row" id="discountRow" aria-label="Opções de desconto">
+              <!-- chips de desconto -->
+              <!-- As opções padrão -->
+              <label class="chip"><input type="radio" name="pct" value="5"><span class="dot"></span>5%</label>
+              <label class="chip"><input type="radio" name="pct" value="10"><span class="dot"></span>10%</label>
+              <label class="chip"><input type="radio" name="pct" value="15"><span class="dot"></span>15%</label>
+              <label class="chip"><input type="radio" name="pct" value="20"><span class="dot"></span>20%</label>
+              <label class="chip"><input type="radio" name="pct" value="25"><span class="dot"></span>25%</label>
+              <label class="chip"><input type="radio" name="pct" value="35"><span class="dot"></span>35%</label>
+
+              <!-- custom -->
+              <label class="chip" id="chipCustom">
+                <input type="radio" name="pct" value="custom">
+                <span class="dot"></span>
+                <span class="customWrap">
+                  <span class="muted">Personalizar</span>
+                  <input id="customPct" type="number" min="0" max="100" step="0.1" placeholder="0,0" disabled>
+                  <span class="pctSuffix">%</span>
+                </span>
+              </label>
+            </div>
+          </div>
+
+          <div class="actions">
+            <button id="calcBtn" class="btn" type="button">Calcular</button>
+            <button id="clearBtn" class="btn outline" type="button" title="Limpar">Limpar</button>
+          </div>
+
+          <span id="err" class="error">Preencha INJEÇÃO e Preço unitário com números válidos. O desconto deve estar entre 0% e 100%.</span>
+
+          <div id="res" class="result" hidden>
+            <div class="rows">
+              <div class="r"><span class="k">Valor base (Injeção × Preço unit):</span><span class="v" id="vBase">R$ 0,00</span></div>
+              <div class="r"><span class="k">Desconto aplicado:</span><span class="v" id="vPct">0%</span></div>
+              <div class="r"><span class="k">Valor do desconto:</span><span class="v" id="vDesc">R$ 0,00</span></div>
+              <div class="r total">
+                <span class="k">Valor a receber do cliente</span>
+                <span class="v" id="vFinal">R$ 0,00</span>
+              </div>
+            </div>
+            <div class="actions" style="margin-top:6px">
+              <button class="btn" id="copyBtn" type="button">Copiar valor final</button>
+              <span class="badge" id="copied" hidden>Copiado</span>
+            </div>
+            <small class="muted">Observação: arredondamento exibido em moeda BRL.</small>
+          </div>
+        </div>
+      </section>
+
+      <!-- Coluna direita: resumo visual -->
+      <section class="card">
+        <h1>Resumo rápido</h1>
+        <div class="rows">
+          <div class="r"><span class="k">Injeção informada</span><span class="v" id="sInj">—</span></div>
+          <div class="r"><span class="k">Preço unit c/ tributos</span><span class="v" id="sUnit">—</span></div>
+          <div class="r"><span class="k">Desconto escolhido</span><span class="v" id="sPct">—</span></div>
+        </div>
+
+        <div class="result" style="margin-top:14px">
+          <div class="r total">
+            <span class="k">Cliente deve pagar</span>
+            <span class="v" id="sFinal" style="font-size:22px">R$ 0,00</span>
+          </div>
+          <p class="muted" style="margin:10px 0 0">
+            Dica: ajuste o desconto para simular cenários. Todos os valores são recalculados em tempo real no botão Calcular.
+          </p>
+        </div>
+
+        <footer>
+          Calculadora de Energia • SCEE • v1.0
+        </footer>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    // Utilidades
+    const toNumber = (str) => {
+      if (typeof str !== 'string') return NaN;
+      // aceita "1.234,56" ou "1234.56"
+      const s = str.trim()
+        .replace(/\s+/g,'')
+        .replace(/\./g,'')     // remove separadores de milhar
+        .replace(/,/g,'.');    // converte vírgula decimal
+      return Number(s);
+    };
+    const fmtBRL = (n) => new Intl.NumberFormat('pt-BR', { style:'currency', currency:'BRL' }).format(n || 0);
+    const clamp = (v, min, max) => Math.min(Math.max(v, min), max);
+
+    // Elementos
+    const inj = document.getElementById('inj');
+    const unit = document.getElementById('unit');
+    const err = document.getElementById('err');
+    const resBox = document.getElementById('res');
+
+    const vBase = document.getElementById('vBase');
+    const vPct = document.getElementById('vPct');
+    const vDesc = document.getElementById('vDesc');
+    const vFinal = document.getElementById('vFinal');
+
+    const sInj = document.getElementById('sInj');
+    const sUnit = document.getElementById('sUnit');
+    const sPct = document.getElementById('sPct');
+    const sFinal = document.getElementById('sFinal');
+
+    const calcBtn = document.getElementById('calcBtn');
+    const clearBtn = document.getElementById('clearBtn');
+    const copyBtn = document.getElementById('copyBtn');
+    const copied = document.getElementById('copied');
+
+    const discountRow = document.getElementById('discountRow');
+    const chipCustom = document.getElementById('chipCustom');
+    const customPct = document.getElementById('customPct');
+
+    // Estética: chips interativos
+    const chips = [...discountRow.querySelectorAll('.chip')];
+    const radioNodes = [...discountRow.querySelectorAll('input[type="radio"]')];
+    function syncChips(){
+      radioNodes.forEach(r => {
+        const chip = r.closest('.chip');
+        chip.dataset.on = r.checked ? 'true':'false';
+      });
+      // habilita custom caso selecionado
+      if (chipCustom.querySelector('input[type="radio"]').checked) {
+        customPct.disabled = false;
+        customPct.focus();
+      } else {
+        customPct.disabled = true;
+      }
+    }
+    radioNodes.forEach(r => r.addEventListener('change', syncChips));
+    chips.forEach(ch => ch.addEventListener('keydown', (e)=>{
+      if(e.key === 'Enter' || e.key === ' '){
+        const r = ch.querySelector('input[type="radio"]');
+        r.checked = true;
+        r.dispatchEvent(new Event('change', {bubbles:true}));
+        e.preventDefault();
+      }
+    }));
+
+    // Seleção padrão de desconto 10%
+    radioNodes.find(r => r.value === '10').checked = true;
+    syncChips();
+
+    // Cálculo
+    function calculate(){
+      err.classList.remove('show');
+      copied.hidden = true;
+
+      const nInj = toNumber(inj.value);
+      const nUnit = toNumber(unit.value);
+
+      // desconto selecionado
+      let pctSel = 0;
+      const selected = radioNodes.find(r => r.checked);
+      if (selected) {
+        if (selected.value === 'custom') {
+          const v = Number(customPct.value.replace(',','.'));
+          pctSel = clamp(isFinite(v) ? v : NaN, 0, 100);
+        } else {
+          pctSel = Number(selected.value);
+        }
+      }
+
+      // validações
+      if (!isFinite(nInj) || nInj < 0 || !isFinite(nUnit) || nUnit < 0 || !isFinite(pctSel)) {
+        err.classList.add('show');
+        document.getElementById('formCard').classList.add('shake');
+        setTimeout(()=>document.getElementById('formCard').classList.remove('shake'), 300);
+        return;
+      }
+
+      const base = nInj * nUnit;
+      const desconto = base * (pctSel/100);
+      const final = base - desconto;
+
+      // escreve
+      vBase.textContent  = fmtBRL(base);
+      vPct.textContent   = `${pctSel.toLocaleString('pt-BR')}%`;
+      vDesc.textContent  = fmtBRL(desconto);
+      vFinal.textContent = fmtBRL(final);
+
+      sInj.textContent   = `${nInj.toLocaleString('pt-BR')} kWh`;
+      sUnit.textContent  = `${fmtBRL(nUnit)} / kWh`;
+      sPct.textContent   = `${pctSel.toLocaleString('pt-BR')}%`;
+      sFinal.textContent = fmtBRL(final);
+
+      resBox.hidden = false;
+    }
+
+    calcBtn.addEventListener('click', calculate);
+
+    // Limpar
+    clearBtn.addEventListener('click', ()=>{
+      inj.value = '';
+      unit.value = '';
+      customPct.value = '';
+      radioNodes.forEach(r => r.checked = false);
+      radioNodes.find(r => r.value === '10').checked = true;
+      syncChips();
+      err.classList.remove('show');
+      resBox.hidden = true;
+      sInj.textContent = '—';
+      sUnit.textContent = '—';
+      sPct.textContent = '—';
+      sFinal.textContent = fmtBRL(0);
+    });
+
+    // Copiar
+    copyBtn.addEventListener('click', async ()=>{
+      const val = vFinal.textContent;
+      try{
+        await navigator.clipboard.writeText(val);
+        copied.hidden = false;
+        setTimeout(()=> copied.hidden = true, 1400);
+      }catch{
+        copied.textContent = 'Falhou ao copiar';
+        copied.hidden = false;
+        copied.style.background = 'linear-gradient(180deg,#ffb3b3,#ff6b6b)';
+        setTimeout(()=> {
+          copied.hidden = true;
+          copied.textContent = 'Copiado';
+          copied.style.background = '';
+        }, 1600);
+      }
+    });
+
+    // UX: Enter para calcular
+    [inj, unit, customPct].forEach(el=>{
+      el.addEventListener('keydown', e=>{
+        if(e.key === 'Enter'){ calculate() }
+      });
+    });
+  </script>
+</body>
+</html>
