@@ -167,20 +167,21 @@
       </div>
 
       <!-- CONTAS SALVAS (novo) -->
-      <div class="grid" style="margin-top:8px">
-        <div class="full">
-          <label class="lbl" for="accountSelect">Contas salvas</label>
-          <div class="row" style="gap:8px; align-items:stretch">
-            <select id="accountSelect" class="inp" style="flex:1; min-width:220px">
-              <option value="">— selecionar conta —</option>
-            </select>
-            <button id="useAccountBtn" class="btn outline" type="button" title="Aplicar">Usar</button>
-            <button id="saveAccountBtn" class="btn" type="button" title="Salvar">Salvar conta</button>
-            <button id="deleteAccountBtn" class="btn ghost" type="button" title="Excluir">Excluir</button>
-          </div>
-          <small class="muted">As contas ficam salvas por usuário (anônimo) no Supabase.</small>
-        </div>
-      </div>
+<div class="grid" style="margin-top:8px">
+  <div class="full">
+    <label class="lbl" for="accountSelect">Contas salvas</label>
+    <div class="row" style="gap:8px; align-items:stretch">
+      <select id="accountSelect" class="inp" style="flex:1; min-width:220px">
+        <option value="">— selecionar conta —</option>
+      </select>
+      <button id="useAccountBtn" class="btn outline" type="button" title="Aplicar">Usar</button>
+      <button id="saveAccountBtn" class="btn" type="button" title="Salvar">Salvar conta</button>
+      <button id="deleteAccountBtn" class="btn ghost" type="button" title="Excluir">Excluir</button>
+      <button id="clearAccountBtn" class="btn ghost" type="button" title="Limpar campos">Limpar</button> <!-- NOVO BOTÃO -->
+    </div>
+    <small class="muted">As contas ficam salvas por usuário (anônimo) no Supabase.</small>
+  </div>
+</div>
 
       <div class="actions">
         <button id="cancelModal" class="btn outline" type="button">Cancelar</button>

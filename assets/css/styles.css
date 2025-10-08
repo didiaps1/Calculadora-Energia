@@ -92,3 +92,17 @@ footer{margin-top:16px;text-align:center;color:var(--muted);font-size:12px;opaci
   .suffix{ display:none }                             /* remove sufixos nos inputs */
   input, select, textarea{ border:1px solid #ccc !important; color:#000 }
 }
+
+/* Correção cor select contas salvas */
+#accountSelect {
+  color: var(--text) !important; /* Texto legível no tema dark */
+  background: rgba(255,255,255,.06) !important;
+}
+#accountSelect option {
+  color: #000 !important; /* Preto nas opções pra contrastar com fundo padrão do browser */
+  background: #fff !important;
+}
+#accountSelect option:checked {
+  color: var(--text) !important; /* Mantém legível quando selecionado */
+  background: rgba(93,211,255,.2) !important; /* Toque de accent */
+}

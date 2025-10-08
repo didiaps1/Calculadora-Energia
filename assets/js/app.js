@@ -1,9 +1,11 @@
-// ===== Supabase =====
+/* ==========================
+   ===== SUPABASE =====
+   ========================== */
 const SUPABASE_URL = 'https://qlgzktpcwlpyeqfkcaut.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFsZ3prdHBjd2xweWVxZmtjYXV0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTk4NjYxMjIsImV4cCI6MjA3NTQ0MjEyMn0.Zuo9F2lo6rkhopeMAITWUBSNuobWti_ai0YDrhJWklE';
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-// Listener de auth state (AGORA, depois do sb)
+// Listener de auth state
 sb.auth.onAuthStateChange((event, session) => {
   console.log('Supabase auth state:', event, session?.user?.id || 'No user');
 });
@@ -15,7 +17,6 @@ async function ensureAuth() {
     const { data: { user } } = await sb.auth.getUser();
     if (user) { 
       currentUser = user; 
-      console.log('User authenticated:', user.id); // Debug extra
       return user; 
     }
 
@@ -23,7 +24,6 @@ async function ensureAuth() {
     if (error) throw error;
 
     currentUser = data.user;
-    console.log('Anonymous user created:', currentUser.id); // Debug extra
     return currentUser;
   } catch (error) {
     console.error('Supabase auth error:', error);
@@ -101,6 +101,7 @@ const accountSelect = document.getElementById('accountSelect');
 const useAccountBtn = document.getElementById('useAccountBtn');
 const saveAccountBtn = document.getElementById('saveAccountBtn');
 const deleteAccountBtn = document.getElementById('deleteAccountBtn');
+const clearAccountBtn = document.getElementById('clearAccountBtn'); // NOVO: botão limpar campos
 
 /* ==========================
    Área do QR
@@ -367,7 +368,7 @@ async function exportShellToPDF(){
 downloadBtn.addEventListener('click', exportShellToPDF);
 
 /* ==========================
-   Contas salvas — helpers
+   Contas salvas — helpers (COM amount COMENTADO)
    ========================== */
 function getPixFormData(){
   return {
@@ -397,10 +398,9 @@ async function dbLoadAccounts(){
     await ensureAuth();
     const { data, error } = await sb.from('accounts')
       .select('*')
-      .eq('user_id', currentUser.id)  // Adicionado: filtra só as contas do user (RLS + performance)
+      .eq('user_id', currentUser.id)
       .order('created_at', { ascending: true });
     if (error) throw error;
-    console.log('Accounts loaded:', data); // Debug extra
     return data || [];
   } catch (error) {
     console.error('Load error:', error);
@@ -409,39 +409,64 @@ async function dbLoadAccounts(){
   }
 }
 async function dbSaveAccount(acc){ // {label,type,key,name?,city?}
-  const user = await ensureAuth();
-  const payload = { ...acc, user_id: user.id };
-  const { error } = await sb.from('accounts')
-    .upsert(payload, { onConflict: 'user_id,label' });
-  if (error) { console.error(error); alert('Erro ao salvar conta'); }
+  try {
+    const user = await ensureAuth();
+    const payload = { ...acc, user_id: user.id, created_at: new Date().toISOString() };
+    const { error } = await sb.from('accounts')
+      .upsert(payload, { onConflict: 'user_id,label' });
+    if (error) throw error;
+  } catch (error) {
+    console.error('Save error:', error);
+    alert('Erro ao salvar conta: ' + error.message);
+  }
 }
 async function dbDeleteAccount(idOrLabel){
-  await ensureAuth();
-  let { error } = await sb.from('accounts').delete().eq('id', idOrLabel);
-  if (error) {
-    const { error: e2 } = await sb.from('accounts')
-      .delete().eq('user_id', currentUser.id).eq('label', idOrLabel);
-    if (e2) { console.error(e2); alert('Erro ao excluir conta'); }
+  try {
+    await ensureAuth();
+    let { error } = await sb.from('accounts').delete().eq('id', idOrLabel).eq('user_id', currentUser.id);
+    if (error) {
+      const { error: e2 } = await sb.from('accounts')
+        .delete().eq('user_id', currentUser.id).eq('label', idOrLabel);
+      if (e2) throw e2;
+    }
+  } catch (error) {
+    console.error('Delete error:', error);
+    alert('Erro ao excluir conta: ' + error.message);
   }
 }
 async function refreshAccountSelect(){
-  const list = await dbLoadAccounts();
-  accountSelect.innerHTML = '<option value="">— selecionar conta —</option>';
-  list.forEach(acc=>{
-    const opt = document.createElement('option');
-    opt.value = acc.id;
-    opt.textContent = acc.label || acc.key;
-    opt.dataset.payload = JSON.stringify(acc);
-    accountSelect.appendChild(opt);
-  });
+  try {
+    const list = await dbLoadAccounts();
+    accountSelect.innerHTML = '<option value="">— selecionar conta —</option>';
+    list.forEach(acc=>{
+      const opt = document.createElement('option');
+      opt.value = acc.id;
+      opt.textContent = acc.label || acc.key || 'Sem nome';
+      opt.dataset.payload = JSON.stringify(acc);
+      accountSelect.appendChild(opt);
+    });
+  } catch (error) {
+    console.error('Refresh error:', error);
+  }
 }
 
 /* ===== Botões de contas ===== */
+// NOVO: Auto-aplicar ao selecionar (change event)
+accountSelect.addEventListener('change', ()=>{
+  const sel = accountSelect.selectedOptions[0];
+  if (!sel || !sel.dataset.payload) return;
+  setPixFormData(JSON.parse(sel.dataset.payload));
+  // Opcional: Scroll pro campo chave pra UX
+  pixKey.scrollIntoView({ behavior: 'smooth', block: 'center' });
+});
+
+// Fallback: Botão "Usar" (ainda funciona, mas redundante)
 useAccountBtn.addEventListener('click', ()=>{
   const sel = accountSelect.selectedOptions[0];
   if (!sel || !sel.dataset.payload){ alert('Selecione uma conta.'); return; }
   setPixFormData(JSON.parse(sel.dataset.payload));
 });
+
 saveAccountBtn.addEventListener('click', async ()=>{
   const data = getPixFormData();
   if (!data.key){ alert('Informe a chave Pix para salvar.'); pixKey.focus(); return; }
@@ -452,6 +477,7 @@ saveAccountBtn.addEventListener('click', async ()=>{
   await refreshAccountSelect();
   alert('Conta salva!');
 });
+
 deleteAccountBtn.addEventListener('click', async ()=>{
   const sel = accountSelect.selectedOptions[0];
   if (!sel || !sel.value){ alert('Selecione uma conta para excluir.'); return; }
@@ -461,8 +487,15 @@ deleteAccountBtn.addEventListener('click', async ()=>{
   await refreshAccountSelect();
   accountSelect.value = '';
   alert('Conta excluída.');
-
 });
 
-
-
+// NOVO: Botão limpar campos (só formulários, não DB)
+clearAccountBtn.addEventListener('click', ()=>{
+  pixKeyType.value = 'Aleatoria';
+  pixKey.value = '';
+  pixName.value = '';
+  pixCity.value = '';
+  pixKey.placeholder = 'Digite a chave'; // Reset placeholder
+  accountSelect.value = ''; // Desseleciona
+  pixKey.focus(); // Foco pro campo principal
+});
