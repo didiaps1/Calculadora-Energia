@@ -218,6 +218,136 @@ if (billInput){
   });
 }
 
+const billTrigger = document.getElementById('billTrigger');
+const billInput = document.getElementById('billUpload');
+const billFileName = document.getElementById('billFileName');
+const billStatus = document.getElementById('billStatus');
+const BILL_STATUS_DEFAULT = 'Envie a conta em PDF para preencher automaticamente.';
+const PDF_JS_SRC = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.3.136/pdf.min.js';
+const PDF_JS_WORKER_SRC = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.3.136/pdf.worker.min.js';
+
+let pdfjsLoaderPromise = null;
+
+function resolvePdfGlobal(){
+  const lib = window.pdfjsLib || window['pdfjs-dist/build/pdf'];
+  if (lib && !window.pdfjsLib) {
+    window.pdfjsLib = lib;
+  }
+  if (lib?.GlobalWorkerOptions && lib.GlobalWorkerOptions.workerSrc !== PDF_JS_WORKER_SRC) {
+    lib.GlobalWorkerOptions.workerSrc = PDF_JS_WORKER_SRC;
+  }
+  return lib || null;
+}
+
+function loadPdfjsScript(){
+  if (pdfjsLoaderPromise) return pdfjsLoaderPromise;
+  pdfjsLoaderPromise = new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = PDF_JS_SRC;
+    script.async = true;
+    script.onload = () => {
+      const lib = resolvePdfGlobal();
+      if (lib) resolve(lib);
+      else reject(new Error('Leitor de PDF não pôde ser inicializado.'));
+    };
+    script.onerror = () => reject(new Error('Falha ao carregar leitor de PDF.'));
+    document.head.appendChild(script);
+  }).catch(error => {
+    pdfjsLoaderPromise = null;
+    throw error;
+  });
+  return pdfjsLoaderPromise;
+}
+
+async function ensurePdfjs(){
+  const lib = resolvePdfGlobal();
+  if (lib) return lib;
+  return loadPdfjsScript();
+}
+
+function setBillStatus(text, state = 'muted'){
+  if (!billStatus) return;
+  billStatus.textContent = text;
+  billStatus.classList.remove('ok', 'error');
+  if (state === 'ok') billStatus.classList.add('ok');
+  if (state === 'error') billStatus.classList.add('error');
+}
+
+function formatLocaleNumber(n, digits){
+  return isFinite(n) ? n.toLocaleString('pt-BR',{minimumFractionDigits:digits,maximumFractionDigits:digits}) : '';
+}
+
+async function extractBillValues(file){
+  const pdfjs = await ensurePdfjs();
+  const pdfjs = window.pdfjsLib;
+  if (!pdfjs) throw new Error('Leitor de PDF não carregado.');
+  const buffer = await file.arrayBuffer();
+  const pdf = await pdfjs.getDocument({ data: buffer }).promise;
+  let fullText = '';
+  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++){
+    const page = await pdf.getPage(pageNum);
+    const content = await page.getTextContent();
+    const pageText = content.items.map(item=>item.str).join(' ');
+    fullText += ' ' + pageText;
+  }
+  const normalized = fullText.replace(/\s+/g,' ').trim();
+  const marker = 'INJEÇÃO SCEE';
+  const upper = normalized.toUpperCase();
+  const idx = upper.indexOf(marker);
+  if (idx === -1) throw new Error('Linha de INJEÇÃO SCEE não encontrada.');
+  const snippet = normalized.slice(idx, idx + 220);
+  const lowerSnippet = snippet.toLowerCase();
+  const afterIndex = lowerSnippet.indexOf('kwh');
+  const numberPattern = /(\d{1,3}(?:\.\d{3})*,\d+|\d+(?:\.\d+)?)/g;
+  let kwhStr = '';
+  let priceStr = '';
+  if (afterIndex !== -1){
+    const after = snippet.slice(afterIndex + 3);
+    const numbers = [...after.matchAll(numberPattern)].map(m=>m[1] || m[0]);
+    if (numbers.length) kwhStr = numbers[0];
+    if (numbers.length > 1) priceStr = numbers[1];
+  }
+  if (!kwhStr || !priceStr){
+    const allNumbers = [...snippet.matchAll(numberPattern)].map(m=>m[1] || m[0])
+      .filter(n => n.replace(/\D/g,'').length <= 8 || n.includes(',') || n.includes('.'));
+    if (!kwhStr && allNumbers.length >= 2) kwhStr = allNumbers[allNumbers.length - 2];
+    if (!priceStr && allNumbers.length >= 1) priceStr = allNumbers[allNumbers.length - 1];
+  }
+  const kwhNum = toNumber(kwhStr);
+  const priceNum = toNumber(priceStr);
+  if (!isFinite(kwhNum)) throw new Error('Valor de kWh não identificado.');
+  if (!isFinite(priceNum)) throw new Error('Valor unitário não identificado.');
+  return { kwh: kwhNum, price: priceNum };
+}
+
+if (billTrigger && billInput){
+  billTrigger.addEventListener('click', ()=> billInput.click());
+}
+
+if (billInput){
+  billInput.addEventListener('change', async ()=>{
+    const file = billInput.files && billInput.files[0];
+    if (!file){
+      if (billFileName) billFileName.textContent = 'Nenhum arquivo selecionado';
+      setBillStatus(BILL_STATUS_DEFAULT);
+      return;
+    }
+    if (billFileName) billFileName.textContent = file.name;
+    setBillStatus('Lendo PDF, aguarde...');
+    try {
+      const { kwh, price } = await extractBillValues(file);
+      inj.value = formatLocaleNumber(kwh, 2);
+      unit.value = formatLocaleNumber(price, 6);
+      calculate();
+      setBillStatus('Valores preenchidos com sucesso!', 'ok');
+      billInput.value = '';
+    } catch (error) {
+      console.error('PDF parse error:', error);
+      setBillStatus(error.message || 'Não foi possível ler o PDF.', 'error');
+    }
+  });
+}
+
 const vBase = document.getElementById('vBase');
 const vPct = document.getElementById('vPct');
 const vDesc = document.getElementById('vDesc');
