@@ -3,16 +3,22 @@
    ========================== */
 const SUPABASE_URL = 'https://qlgzktpcwlpyeqfkcaut.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFsZ3prdHBjd2xweWVxZmtjYXV0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTk4NjYxMjIsImV4cCI6MjA3NTQ0MjEyMn0.Zuo9F2lo6rkhopeMAITWUBSNuobWti_ai0YDrhJWklE';
-const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const supabaseLib = typeof window !== 'undefined' ? window.supabase : undefined;
+const hasSupabaseSDK = !!(supabaseLib && typeof supabaseLib.createClient === 'function');
+const sb = hasSupabaseSDK ? supabaseLib.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
 
-// Listener de auth state
-sb.auth.onAuthStateChange((event, session) => {
-  console.log('Supabase auth state:', event, session?.user?.id || 'No user');
-});
+if (sb) {
+  sb.auth.onAuthStateChange((event, session) => {
+    console.log('Supabase auth state:', event, session?.user?.id || 'No user');
+  });
+} else {
+  console.warn('Supabase SDK não carregou; recursos de contas salvas foram desativados.');
+}
 
 // login anônimo (gera um user_id por navegador)
 let currentUser = null;
 async function ensureAuth() {
+  if (!sb) return null;
   try {
     const { data: { user } } = await sb.auth.getUser();
     if (user) { 
@@ -58,6 +64,224 @@ const unit = document.getElementById('unit');
 const err = document.getElementById('err');
 const resBox = document.getElementById('res');
 
+const billTrigger = document.getElementById('billTrigger');
+const billInput = document.getElementById('billUpload');
+const billFileName = document.getElementById('billFileName');
+const billStatus = document.getElementById('billStatus');
+const BILL_STATUS_DEFAULT = 'Envie a conta em PDF para preencher automaticamente.';
+
+function setBillStatus(text, state = 'muted'){
+  if (!billStatus) return;
+  billStatus.textContent = text;
+  billStatus.classList.remove('ok', 'error');
+  if (state === 'ok') billStatus.classList.add('ok');
+  if (state === 'error') billStatus.classList.add('error');
+}
+
+function formatLocaleNumber(n, digits){
+  return isFinite(n) ? n.toLocaleString('pt-BR',{minimumFractionDigits:digits,maximumFractionDigits:digits}) : '';
+}
+
+async function flateDecode(bytes){
+  if (typeof DecompressionStream === 'function'){
+    for (const format of ['deflate', 'deflate-raw']){
+      try {
+        const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream(format));
+        const buffer = await new Response(stream).arrayBuffer();
+        if (buffer.byteLength){
+          return new TextDecoder('utf-8').decode(buffer);
+        }
+      } catch (error) {
+        console.warn(`DecompressionStream ${format} falhou`, error);
+      }
+    }
+  }
+  throw new Error('Este navegador não suporta a leitura automática do PDF.');
+}
+
+async function extractPdfText(buffer){
+  const bytes = new Uint8Array(buffer);
+  const latin1Decoder = new TextDecoder('latin1');
+  const asciiSnapshot = latin1Decoder.decode(bytes);
+  const segments = [];
+  let hadCompressedStream = false;
+  let decodeFailed = false;
+  let decodeErrorMessage = '';
+  const streamRegex = /<<[\s\S]*?>>\s*stream\r?\n/g;
+  let match;
+  while ((match = streamRegex.exec(asciiSnapshot)) !== null){
+    const dict = match[0];
+    const hasFlate = /\/Filter\s*(?:\[[^\]]*\/FlateDecode[^\]]*\]|\/FlateDecode)/.test(dict);
+    const start = streamRegex.lastIndex;
+    const end = asciiSnapshot.indexOf('endstream', start);
+    if (end === -1) break;
+    let startIndex = start;
+    if (bytes[startIndex] === 0x0d && bytes[startIndex + 1] === 0x0a) startIndex += 2;
+    else if (bytes[startIndex] === 0x0a || bytes[startIndex] === 0x0d) startIndex += 1;
+    let endIndex = end;
+    while (endIndex > startIndex && (bytes[endIndex - 1] === 0x0d || bytes[endIndex - 1] === 0x0a)) endIndex--;
+    let chunk = bytes.slice(startIndex, endIndex);
+    if (!chunk.length) continue;
+    let textChunk = '';
+    try {
+      if (hasFlate){
+        hadCompressedStream = true;
+        textChunk = await flateDecode(chunk);
+      } else {
+        textChunk = latin1Decoder.decode(chunk);
+      }
+    } catch (error) {
+      decodeFailed = true;
+      if (!decodeErrorMessage && error && error.message) decodeErrorMessage = String(error.message);
+      console.warn('Falha ao decodificar parte do PDF', error);
+      continue;
+    }
+    if (textChunk) segments.push(textChunk.replace(/\0/g, ' '));
+  }
+  if (!segments.length) segments.push(asciiSnapshot.replace(/\0/g, ' '));
+  return {
+    text: segments.join(' '),
+    hadCompressedStream,
+    decodeFailed,
+    decodeErrorMessage
+  };
+}
+
+function normalizeAccents(str){
+  return str.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
+async function extractBillValues(file){
+  const buffer = await file.arrayBuffer();
+  const { text, hadCompressedStream, decodeFailed, decodeErrorMessage } = await extractPdfText(buffer);
+  const rawText = text.replace(/\s+/g, ' ').trim();
+  if (!rawText && hadCompressedStream && decodeFailed){
+    const fallbackMsg = decodeErrorMessage || 'Não foi possível extrair o texto comprimido do PDF neste navegador. Use um navegador atualizado (Chrome ou Edge) ou informe os valores manualmente.';
+    throw new Error(fallbackMsg);
+  }
+  if (!rawText){
+    throw new Error('Não foi possível ler o conteúdo do PDF.');
+  }
+  const upper = rawText.toUpperCase();
+  const normalized = normalizeAccents(rawText);
+  const upperNormalized = normalized.toUpperCase();
+  const anchors = [
+    { term: 'INJEÇÃO SCEE', normalized: 'INJECAO SCEE' },
+    { term: 'CRÉDITO RECEBIDO', normalized: 'CREDITO RECEBIDO' },
+    { term: 'CREDITO RECEBIDO', normalized: 'CREDITO RECEBIDO' },
+    { term: '(CRÉDITO RECEBIDO)', normalized: '(CREDITO RECEBIDO)' },
+    { term: '(CREDITO RECEBIDO)', normalized: '(CREDITO RECEBIDO)' }
+  ];
+
+  let snippet = '';
+  for (const anchor of anchors){
+    let idx = upper.indexOf(anchor.term);
+    let baseText = rawText;
+    if (idx === -1){
+      idx = upperNormalized.indexOf(anchor.normalized);
+      baseText = normalized;
+    }
+    if (idx !== -1){
+      snippet = baseText.slice(Math.max(0, idx - 80), idx + 260);
+      break;
+    }
+  }
+
+  if (!snippet){
+    const fallbackMatch = rawText.match(/KWH[^\d]*[\d.,]+/i);
+    if (fallbackMatch){
+      const idx = fallbackMatch.index ?? rawText.indexOf(fallbackMatch[0]);
+      const start = Math.max(0, idx - 120);
+      snippet = rawText.slice(start, start + 320);
+    }
+  }
+
+  if (!snippet){
+    throw new Error('Linha de INJEÇÃO SCEE, CRÉDITO RECEBIDO ou campo KWh não encontrada.');
+  }
+
+  const numberPattern = /(\d{1,3}(?:\.\d{3})*,\d+|\d+(?:\.\d+)?)/g;
+  const numberMatches = [...snippet.matchAll(numberPattern)].map(match => ({
+    raw: match[1] || match[0],
+    value: toNumber(match[1] || match[0]),
+    index: match.index ?? snippet.indexOf(match[0])
+  })).filter(entry => isFinite(entry.value));
+
+  const kwhFromTag = (()=>{
+    const match = snippet.match(/KWH[^\d]*([\d.,]+)/i);
+    if (!match) return null;
+    return { raw: match[1], value: toNumber(match[1]) };
+  })();
+
+  let kwhCandidate = kwhFromTag;
+  if (!kwhCandidate){
+    kwhCandidate = numberMatches.find(entry => entry.value >= 1);
+  }
+
+  const kwhIndexInList = kwhCandidate
+    ? numberMatches.findIndex(entry => entry.raw === kwhCandidate.raw || entry.value === kwhCandidate.value)
+    : -1;
+
+  const priceFromLabel = (()=>{
+    const match = snippet.match(/(?:PRE[CÇ]O\s*UNIT[^\d]*|R\$[^\d]*)\s*([\d.,]+)/i);
+    if (!match) return null;
+    return { raw: match[1], value: toNumber(match[1]) };
+  })();
+
+  let priceCandidate = priceFromLabel;
+  if (!priceCandidate && kwhIndexInList !== -1){
+    const after = numberMatches.slice(kwhIndexInList + 1);
+    priceCandidate = after.find(entry => entry.value > 0 && entry.value < 5)
+      || after.find(entry => entry.value > 0);
+  }
+
+  if (!priceCandidate){
+    priceCandidate = numberMatches.find(entry => entry.value > 0 && entry.value < 5)
+      || numberMatches.find(entry => entry.value > 0);
+  }
+
+  if (!kwhCandidate){
+    throw new Error('Valor de kWh não identificado.');
+  }
+  if (!priceCandidate){
+    throw new Error('Valor unitário não identificado.');
+  }
+
+  const kwhNum = toNumber(kwhCandidate.raw);
+  const priceNum = toNumber(priceCandidate.raw);
+  if (!isFinite(kwhNum)) throw new Error('Valor de kWh não identificado.');
+  if (!isFinite(priceNum)) throw new Error('Valor unitário não identificado.');
+  return { kwh: kwhNum, price: priceNum };
+}
+
+if (billTrigger && billInput){
+  billTrigger.addEventListener('click', ()=> billInput.click());
+}
+
+if (billInput){
+  billInput.addEventListener('change', async ()=>{
+    const file = billInput.files && billInput.files[0];
+    if (!file){
+      if (billFileName) billFileName.textContent = 'Nenhum arquivo selecionado';
+      setBillStatus(BILL_STATUS_DEFAULT);
+      return;
+    }
+    if (billFileName) billFileName.textContent = file.name;
+    setBillStatus('Lendo PDF, aguarde...');
+    try {
+      const { kwh, price } = await extractBillValues(file);
+      inj.value = formatLocaleNumber(kwh, 2);
+      unit.value = formatLocaleNumber(price, 6);
+      calculate();
+      setBillStatus('Valores preenchidos com sucesso!', 'ok');
+      billInput.value = '';
+    } catch (error) {
+      console.error('PDF parse error:', error);
+      setBillStatus(error.message || 'Não foi possível ler o PDF.', 'error');
+    }
+  });
+}
+
 const vBase = document.getElementById('vBase');
 const vPct = document.getElementById('vPct');
 const vDesc = document.getElementById('vDesc');
@@ -102,6 +326,27 @@ const useAccountBtn = document.getElementById('useAccountBtn');
 const saveAccountBtn = document.getElementById('saveAccountBtn');
 const deleteAccountBtn = document.getElementById('deleteAccountBtn');
 const clearAccountBtn = document.getElementById('clearAccountBtn'); // NOVO: botão limpar campos
+
+const accountHelperText = accountSelect ? accountSelect.closest('.full')?.querySelector('small.muted') : null;
+const ACCOUNT_FEATURES_DISABLED_MESSAGE = 'Sincronizar contas requer conexão com o Supabase, indisponível no momento.';
+function disableAccountFeatures(message){
+  if (accountSelect){
+    accountSelect.innerHTML = '<option value="">Recurso indisponível</option>';
+    accountSelect.disabled = true;
+  }
+  [useAccountBtn, saveAccountBtn, deleteAccountBtn].forEach(btn => {
+    if (btn){
+      btn.disabled = true;
+      btn.title = message;
+    }
+  });
+  if (accountHelperText){
+    accountHelperText.textContent = message;
+  }
+}
+if (!sb){
+  disableAccountFeatures(ACCOUNT_FEATURES_DISABLED_MESSAGE);
+}
 
 /* ==========================
    Área do QR
@@ -211,6 +456,9 @@ clearBtn.addEventListener('click', ()=>{
   err.classList.remove('show'); resBox.hidden=true;
   sInj.textContent='—'; sUnit.textContent='—'; sPct.textContent='—'; sFinal.textContent=fmtBRL(0);
   qrcodeBox.innerHTML=''; qrArea.classList.add('hidden'); qrPayload.value='';
+  if (billInput) billInput.value='';
+  if (billFileName) billFileName.textContent='Nenhum arquivo selecionado';
+  setBillStatus(BILL_STATUS_DEFAULT);
 });
 
 /* ==========================
@@ -394,6 +642,7 @@ function setPixFormData(acc){
 
 /* ===== Supabase: CRUD de contas ===== */
 async function dbLoadAccounts(){
+  if (!sb) return [];
   try {
     await ensureAuth();
     const { data, error } = await sb.from('accounts')
@@ -409,6 +658,10 @@ async function dbLoadAccounts(){
   }
 }
 async function dbSaveAccount(acc){ // {label,type,key,name?,city?}
+  if (!sb) {
+    alert(ACCOUNT_FEATURES_DISABLED_MESSAGE);
+    return;
+  }
   try {
     const user = await ensureAuth();
     const payload = { ...acc, user_id: user.id, created_at: new Date().toISOString() };
@@ -421,6 +674,10 @@ async function dbSaveAccount(acc){ // {label,type,key,name?,city?}
   }
 }
 async function dbDeleteAccount(idOrLabel){
+  if (!sb) {
+    alert(ACCOUNT_FEATURES_DISABLED_MESSAGE);
+    return;
+  }
   try {
     await ensureAuth();
     let { error } = await sb.from('accounts').delete().eq('id', idOrLabel).eq('user_id', currentUser.id);
@@ -435,6 +692,10 @@ async function dbDeleteAccount(idOrLabel){
   }
 }
 async function refreshAccountSelect(){
+  if (!sb) {
+    disableAccountFeatures(ACCOUNT_FEATURES_DISABLED_MESSAGE);
+    return;
+  }
   try {
     const list = await dbLoadAccounts();
     accountSelect.innerHTML = '<option value="">— selecionar conta —</option>';
@@ -468,6 +729,10 @@ useAccountBtn.addEventListener('click', ()=>{
 });
 
 saveAccountBtn.addEventListener('click', async ()=>{
+  if (!sb) {
+    alert(ACCOUNT_FEATURES_DISABLED_MESSAGE);
+    return;
+  }
   const data = getPixFormData();
   if (!data.key){ alert('Informe a chave Pix para salvar.'); pixKey.focus(); return; }
   const label = prompt('Nome da conta (ex.: Conta 1, Leticia):', data.name || data.key);
@@ -479,6 +744,10 @@ saveAccountBtn.addEventListener('click', async ()=>{
 });
 
 deleteAccountBtn.addEventListener('click', async ()=>{
+  if (!sb) {
+    alert(ACCOUNT_FEATURES_DISABLED_MESSAGE);
+    return;
+  }
   const sel = accountSelect.selectedOptions[0];
   if (!sel || !sel.value){ alert('Selecione uma conta para excluir.'); return; }
   const acc = JSON.parse(sel.dataset.payload);
