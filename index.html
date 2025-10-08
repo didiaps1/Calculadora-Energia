@@ -206,6 +206,16 @@
   <!-- 2) Captura e PDF (usados no app.js) -->
   <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.3.136/pdf.min.js" data-source="cdn-pdfjs"></script>
+  <script>
+    (function () {
+      const globalPdf = window.pdfjsLib || window['pdfjs-dist/build/pdf'];
+      if (!globalPdf) return;
+      window.pdfjsLib = globalPdf;
+      if (globalPdf.GlobalWorkerOptions) {
+        globalPdf.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.3.136/pdf.worker.min.js';
+      }
+    })();
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.3.136/pdf.min.js"></script>
   <script>
     if (window.pdfjsLib) {

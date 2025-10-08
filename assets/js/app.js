@@ -63,6 +63,47 @@ const billInput = document.getElementById('billUpload');
 const billFileName = document.getElementById('billFileName');
 const billStatus = document.getElementById('billStatus');
 const BILL_STATUS_DEFAULT = 'Envie a conta em PDF para preencher automaticamente.';
+const PDF_JS_SRC = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.3.136/pdf.min.js';
+const PDF_JS_WORKER_SRC = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.3.136/pdf.worker.min.js';
+
+let pdfjsLoaderPromise = null;
+
+function resolvePdfGlobal(){
+  const lib = window.pdfjsLib || window['pdfjs-dist/build/pdf'];
+  if (lib && !window.pdfjsLib) {
+    window.pdfjsLib = lib;
+  }
+  if (lib?.GlobalWorkerOptions && lib.GlobalWorkerOptions.workerSrc !== PDF_JS_WORKER_SRC) {
+    lib.GlobalWorkerOptions.workerSrc = PDF_JS_WORKER_SRC;
+  }
+  return lib || null;
+}
+
+function loadPdfjsScript(){
+  if (pdfjsLoaderPromise) return pdfjsLoaderPromise;
+  pdfjsLoaderPromise = new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = PDF_JS_SRC;
+    script.async = true;
+    script.onload = () => {
+      const lib = resolvePdfGlobal();
+      if (lib) resolve(lib);
+      else reject(new Error('Leitor de PDF não pôde ser inicializado.'));
+    };
+    script.onerror = () => reject(new Error('Falha ao carregar leitor de PDF.'));
+    document.head.appendChild(script);
+  }).catch(error => {
+    pdfjsLoaderPromise = null;
+    throw error;
+  });
+  return pdfjsLoaderPromise;
+}
+
+async function ensurePdfjs(){
+  const lib = resolvePdfGlobal();
+  if (lib) return lib;
+  return loadPdfjsScript();
+}
 
 function setBillStatus(text, state = 'muted'){
   if (!billStatus) return;
@@ -77,6 +118,7 @@ function formatLocaleNumber(n, digits){
 }
 
 async function extractBillValues(file){
+  const pdfjs = await ensurePdfjs();
   const pdfjs = window.pdfjsLib;
   if (!pdfjs) throw new Error('Leitor de PDF não carregado.');
   const buffer = await file.arrayBuffer();
