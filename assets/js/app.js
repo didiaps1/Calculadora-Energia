@@ -163,34 +163,81 @@ async function extractBillValues(file){
     throw new Error('Não foi possível ler o conteúdo do PDF.');
   }
   const upper = rawText.toUpperCase();
-  let idx = upper.indexOf('INJEÇÃO SCEE');
-  let sourceForSlice = rawText;
-  if (idx === -1){
-    const withoutAccents = normalizeAccents(rawText);
-    idx = withoutAccents.toUpperCase().indexOf('INJECAO SCEE');
-    sourceForSlice = withoutAccents;
+  const normalized = normalizeAccents(rawText);
+  const upperNormalized = normalized.toUpperCase();
+  const anchors = [
+    { term: 'INJEÇÃO SCEE', normalized: 'INJECAO SCEE' },
+    { term: 'CRÉDITO RECEBIDO', normalized: 'CREDITO RECEBIDO' },
+    { term: 'CREDITO RECEBIDO', normalized: 'CREDITO RECEBIDO' }
+  ];
+
+  let snippet = '';
+  for (const anchor of anchors){
+    let idx = upper.indexOf(anchor.term);
+    let baseText = rawText;
+    if (idx === -1){
+      idx = upperNormalized.indexOf(anchor.normalized);
+      baseText = normalized;
+    }
+    if (idx !== -1){
+      snippet = baseText.slice(Math.max(0, idx - 80), idx + 260);
+      break;
+    }
   }
-  if (idx === -1) throw new Error('Linha de INJEÇÃO SCEE não encontrada.');
-  const snippet = sourceForSlice.slice(Math.max(0, idx - 40), idx + 220);
-  const lowerSnippet = snippet.toLowerCase();
-  const afterIndex = lowerSnippet.indexOf('kwh');
+
+  if (!snippet){
+    throw new Error('Linha de INJEÇÃO SCEE ou CRÉDITO RECEBIDO não encontrada.');
+  }
+
   const numberPattern = /(\d{1,3}(?:\.\d{3})*,\d+|\d+(?:\.\d+)?)/g;
-  let kwhStr = '';
-  let priceStr = '';
-  if (afterIndex !== -1){
-    const after = snippet.slice(afterIndex + 3);
-    const numbers = [...after.matchAll(numberPattern)].map(m=>m[1] || m[0]);
-    if (numbers.length) kwhStr = numbers[0];
-    if (numbers.length > 1) priceStr = numbers[1];
+  const numberMatches = [...snippet.matchAll(numberPattern)].map(match => ({
+    raw: match[1] || match[0],
+    value: toNumber(match[1] || match[0]),
+    index: match.index ?? snippet.indexOf(match[0])
+  })).filter(entry => isFinite(entry.value));
+
+  const kwhFromTag = (()=>{
+    const match = snippet.match(/KWH[^\d]*([\d.,]+)/i);
+    if (!match) return null;
+    return { raw: match[1], value: toNumber(match[1]) };
+  })();
+
+  let kwhCandidate = kwhFromTag;
+  if (!kwhCandidate){
+    kwhCandidate = numberMatches.find(entry => entry.value >= 1);
   }
-  if (!kwhStr || !priceStr){
-    const allNumbers = [...snippet.matchAll(numberPattern)].map(m=>m[1] || m[0])
-      .filter(n => n.replace(/\D/g,'').length <= 8 || n.includes(',') || n.includes('.'));
-    if (!kwhStr && allNumbers.length >= 2) kwhStr = allNumbers[allNumbers.length - 2];
-    if (!priceStr && allNumbers.length >= 1) priceStr = allNumbers[allNumbers.length - 1];
+
+  const kwhIndexInList = kwhCandidate
+    ? numberMatches.findIndex(entry => entry.raw === kwhCandidate.raw || entry.value === kwhCandidate.value)
+    : -1;
+
+  const priceFromLabel = (()=>{
+    const match = snippet.match(/(?:PRE[CÇ]O\s*UNIT[^\d]*|R\$[^\d]*)\s*([\d.,]+)/i);
+    if (!match) return null;
+    return { raw: match[1], value: toNumber(match[1]) };
+  })();
+
+  let priceCandidate = priceFromLabel;
+  if (!priceCandidate && kwhIndexInList !== -1){
+    const after = numberMatches.slice(kwhIndexInList + 1);
+    priceCandidate = after.find(entry => entry.value > 0 && entry.value < 5)
+      || after.find(entry => entry.value > 0);
   }
-  const kwhNum = toNumber(kwhStr);
-  const priceNum = toNumber(priceStr);
+
+  if (!priceCandidate){
+    priceCandidate = numberMatches.find(entry => entry.value > 0 && entry.value < 5)
+      || numberMatches.find(entry => entry.value > 0);
+  }
+
+  if (!kwhCandidate){
+    throw new Error('Valor de kWh não identificado.');
+  }
+  if (!priceCandidate){
+    throw new Error('Valor unitário não identificado.');
+  }
+
+  const kwhNum = toNumber(kwhCandidate.raw);
+  const priceNum = toNumber(priceCandidate.raw);
   if (!isFinite(kwhNum)) throw new Error('Valor de kWh não identificado.');
   if (!isFinite(priceNum)) throw new Error('Valor unitário não identificado.');
   return { kwh: kwhNum, price: priceNum };
