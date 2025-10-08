@@ -99,11 +99,107 @@ async function flateDecode(bytes){
   throw new Error('Este navegador não suporta a leitura automática do PDF.');
 }
 
+function decodePdfLiteralString(source, startIndex){
+  const chars = [];
+  let i = startIndex;
+  while (i < source.length){
+    const ch = source[i];
+    if (ch === ')'){
+      return { value: chars.join(''), nextIndex: i + 1 };
+    }
+    if (ch === '\\'){
+      const next = source[i + 1];
+      if (next === undefined){
+        return { value: chars.join(''), nextIndex: source.length };
+      }
+      if (/^[0-7]$/.test(next)){
+        let oct = next;
+        let consumed = 1;
+        for (let j = 2; j <= 3 && /^[0-7]$/.test(source[i + j]); j++){
+          oct += source[i + j];
+          consumed++;
+        }
+        chars.push(String.fromCharCode(parseInt(oct, 8)));
+        i += consumed + 1;
+        continue;
+      }
+      const map = { n: '\n', r: '\r', t: '\t', b: '\b', f: '\f', '(': '(', ')': ')', '\\': '\\' };
+      chars.push(map[next] ?? next);
+      i += 2;
+      continue;
+    }
+    chars.push(ch);
+    i++;
+  }
+  return { value: chars.join(''), nextIndex: source.length };
+}
+
+function decodePdfHexString(source, startIndex){
+  let i = startIndex;
+  let hex = '';
+  while (i < source.length){
+    const ch = source[i];
+    if (ch === '>'){
+      break;
+    }
+    if (!/\s/.test(ch)){
+      hex += ch;
+    }
+    i++;
+  }
+  if (hex.length % 2 === 1){
+    hex += '0';
+  }
+  let value = '';
+  for (let j = 0; j < hex.length; j += 2){
+    const code = parseInt(hex.slice(j, j + 2), 16);
+    value += String.fromCharCode(code);
+  }
+  if (value.length >= 2 && value.charCodeAt(0) === 0xFE && value.charCodeAt(1) === 0xFF){
+    let decoded = '';
+    for (let k = 2; k < value.length; k += 2){
+      decoded += String.fromCharCode((value.charCodeAt(k) << 8) + (value.charCodeAt(k + 1) || 0));
+    }
+    value = decoded;
+  }
+  return { value, nextIndex: i + 1 };
+}
+
+function sanitizePdfString(raw){
+  let value = raw;
+  if (value.length >= 2 && value.charCodeAt(0) === 0xFE && value.charCodeAt(1) === 0xFF){
+    let decoded = '';
+    for (let i = 2; i < value.length; i += 2){
+      decoded += String.fromCharCode((value.charCodeAt(i) << 8) + (value.charCodeAt(i + 1) || 0));
+    }
+    value = decoded;
+  }
+  return value.replace(/[\r\n]+/g, ' ').trim();
+}
+
+function collectPdfStrings(content){
+  const strings = [];
+  for (let i = 0; i < content.length; i++){
+    const ch = content[i];
+    if (ch === '('){
+      const { value, nextIndex } = decodePdfLiteralString(content, i + 1);
+      if (value) strings.push(sanitizePdfString(value));
+      i = nextIndex - 1;
+    } else if (ch === '<' && content[i + 1] !== '<'){
+      const { value, nextIndex } = decodePdfHexString(content, i + 1);
+      if (value) strings.push(sanitizePdfString(value));
+      i = nextIndex - 1;
+    }
+  }
+  return strings;
+}
+
 async function extractPdfText(buffer){
   const bytes = new Uint8Array(buffer);
   const latin1Decoder = new TextDecoder('latin1');
   const asciiSnapshot = latin1Decoder.decode(bytes);
   const segments = [];
+  const textSnippets = [];
   let hadCompressedStream = false;
   let decodeFailed = false;
   let decodeErrorMessage = '';
@@ -120,7 +216,7 @@ async function extractPdfText(buffer){
     else if (bytes[startIndex] === 0x0a || bytes[startIndex] === 0x0d) startIndex += 1;
     let endIndex = end;
     while (endIndex > startIndex && (bytes[endIndex - 1] === 0x0d || bytes[endIndex - 1] === 0x0a)) endIndex--;
-    let chunk = bytes.slice(startIndex, endIndex);
+    const chunk = bytes.slice(startIndex, endIndex);
     if (!chunk.length) continue;
     let textChunk = '';
     try {
@@ -136,11 +232,26 @@ async function extractPdfText(buffer){
       console.warn('Falha ao decodificar parte do PDF', error);
       continue;
     }
-    if (textChunk) segments.push(textChunk.replace(/\0/g, ' '));
+    if (textChunk){
+      const cleaned = textChunk.replace(/\0/g, ' ');
+      segments.push(cleaned);
+      collectPdfStrings(cleaned).forEach(str => {
+        if (str) textSnippets.push(str);
+      });
+    }
   }
-  if (!segments.length) segments.push(asciiSnapshot.replace(/\0/g, ' '));
+  if (!segments.length){
+    const fallback = asciiSnapshot.replace(/\0/g, ' ');
+    segments.push(fallback);
+    collectPdfStrings(fallback).forEach(str => {
+      if (str) textSnippets.push(str);
+    });
+  }
+  const joinedText = segments.join(' ');
+  const joinedSnippets = textSnippets.join(' ');
   return {
-    text: segments.join(' '),
+    text: joinedText,
+    extractedStrings: joinedSnippets,
     hadCompressedStream,
     decodeFailed,
     decodeErrorMessage
@@ -148,13 +259,15 @@ async function extractPdfText(buffer){
 }
 
 function normalizeAccents(str){
+  if (!str) return '';
   return str.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 }
 
 async function extractBillValues(file){
   const buffer = await file.arrayBuffer();
-  const { text, hadCompressedStream, decodeFailed, decodeErrorMessage } = await extractPdfText(buffer);
-  const rawText = text.replace(/\s+/g, ' ').trim();
+  const { text, extractedStrings, hadCompressedStream, decodeFailed, decodeErrorMessage } = await extractPdfText(buffer);
+  const sourceText = extractedStrings && extractedStrings.length > 40 ? extractedStrings : text;
+  const rawText = sourceText.replace(/\s+/g, ' ').trim();
   if (!rawText && hadCompressedStream && decodeFailed){
     const fallbackMsg = decodeErrorMessage || 'Não foi possível extrair o texto comprimido do PDF neste navegador. Use um navegador atualizado (Chrome ou Edge) ou informe os valores manualmente.';
     throw new Error(fallbackMsg);
@@ -197,7 +310,7 @@ async function extractBillValues(file){
   }
 
   if (!snippet){
-    throw new Error('Linha de INJEÇÃO SCEE, CRÉDITO RECEBIDO ou campo KWh não encontrada.');
+    throw new Error('Não foi possível localizar os campos de crédito no PDF. Informe os valores manualmente ou envie o arquivo completo.');
   }
 
   const numberPattern = /(\d{1,3}(?:\.\d{3})*,\d+|\d+(?:\.\d+)?)/g;
@@ -241,16 +354,16 @@ async function extractBillValues(file){
   }
 
   if (!kwhCandidate){
-    throw new Error('Valor de kWh não identificado.');
+    throw new Error('Valor de kWh não identificado no PDF.');
   }
   if (!priceCandidate){
-    throw new Error('Valor unitário não identificado.');
+    throw new Error('Valor unitário não identificado no PDF.');
   }
 
   const kwhNum = toNumber(kwhCandidate.raw);
   const priceNum = toNumber(priceCandidate.raw);
-  if (!isFinite(kwhNum)) throw new Error('Valor de kWh não identificado.');
-  if (!isFinite(priceNum)) throw new Error('Valor unitário não identificado.');
+  if (!isFinite(kwhNum)) throw new Error('Valor de kWh não identificado no PDF.');
+  if (!isFinite(priceNum)) throw new Error('Valor unitário não identificado no PDF.');
   return { kwh: kwhNum, price: priceNum };
 }
 
