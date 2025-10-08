@@ -367,7 +367,7 @@ function getPixFormData(){
   return {
     type: pixKeyType.value,           // CPF, CNPJ, Telefone, Email, Aleatoria
     key: (pixKey.value || '').trim(),
-    amount: (pixAmount.value || '').trim(),
+    // amount: (pixAmount.value || '').trim(),  // COMENTADO: não salvar, é variável
     name: (pixName.value || '').trim(),
     city: (pixCity.value || '').trim()
   };
@@ -376,10 +376,10 @@ function setPixFormData(acc){
   if (!acc) return;
   pixKeyType.value = acc.type || 'Aleatoria';
   pixKey.value = acc.key || '';
-  if (acc.amount) pixAmount.value = acc.amount; // opcional
+  // if (acc.amount) pixAmount.value = acc.amount;  // COMENTADO: não setar, valor é dinâmico
   pixName.value = acc.name || '';
   pixCity.value = acc.city || '';
-  // placeholder de telefone
+  // placeholder de telefone (permanece igual)
   const t = pixKeyType.value;
   if (t === 'Telefone'){ pixKey.placeholder = '+55DDDNUMERO'; if (!pixKey.value.startsWith('+55') && !pixKey.value) pixKey.value = '+55'; }
   else { pixKey.placeholder = 'Digite a chave'; }
@@ -449,4 +449,5 @@ deleteAccountBtn.addEventListener('click', async ()=>{
   alert('Conta excluída.');
 
 });
+
 
