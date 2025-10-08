@@ -1,23 +1,29 @@
-sb.auth.onAuthStateChange((event, session) => {
-  console.log('Supabase auth state:', event, session?.user?.id || 'No user');
-});
-
 // ===== Supabase =====
 const SUPABASE_URL = 'https://qlgzktpcwlpyeqfkcaut.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFsZ3prdHBjd2xweWVxZmtjYXV0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTk4NjYxMjIsImV4cCI6MjA3NTQ0MjEyMn0.Zuo9F2lo6rkhopeMAITWUBSNuobWti_ai0YDrhJWklE';
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+// Listener de auth state (AGORA, depois do sb)
+sb.auth.onAuthStateChange((event, session) => {
+  console.log('Supabase auth state:', event, session?.user?.id || 'No user');
+});
 
 // login anônimo (gera um user_id por navegador)
 let currentUser = null;
 async function ensureAuth() {
   try {
     const { data: { user } } = await sb.auth.getUser();
-    if (user) { currentUser = user; return user; }
+    if (user) { 
+      currentUser = user; 
+      console.log('User authenticated:', user.id); // Debug extra
+      return user; 
+    }
 
     const { data, error } = await sb.auth.signInAnonymously();
     if (error) throw error;
 
     currentUser = data.user;
+    console.log('Anonymous user created:', currentUser.id); // Debug extra
     return currentUser;
   } catch (error) {
     console.error('Supabase auth error:', error);
@@ -387,12 +393,20 @@ function setPixFormData(acc){
 
 /* ===== Supabase: CRUD de contas ===== */
 async function dbLoadAccounts(){
-  await ensureAuth();
-  const { data, error } = await sb.from('accounts')
-    .select('*')
-    .order('created_at', { ascending: true });
-  if (error) { console.error(error); alert('Erro ao listar contas'); return []; }
-  return data || [];
+  try {
+    await ensureAuth();
+    const { data, error } = await sb.from('accounts')
+      .select('*')
+      .eq('user_id', currentUser.id)  // Adicionado: filtra só as contas do user (RLS + performance)
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+    console.log('Accounts loaded:', data); // Debug extra
+    return data || [];
+  } catch (error) {
+    console.error('Load error:', error);
+    alert('Erro ao listar contas: ' + error.message);
+    return [];
+  }
 }
 async function dbSaveAccount(acc){ // {label,type,key,name?,city?}
   const user = await ensureAuth();
@@ -449,5 +463,6 @@ deleteAccountBtn.addEventListener('click', async ()=>{
   alert('Conta excluída.');
 
 });
+
 
 
