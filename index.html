@@ -31,6 +31,16 @@
             </div>
           </div>
 
+          <div class="full">
+            <label class="lbl" for="billUpload">Importar conta (PDF)</label>
+            <div class="row uploadRow">
+              <button id="billTrigger" class="btn outline" type="button">Selecionar PDF</button>
+              <span id="billFileName" class="muted">Nenhum arquivo selecionado</span>
+            </div>
+            <input id="billUpload" type="file" accept="application/pdf" hidden>
+            <small id="billStatus" class="billStatus">Envie a conta em PDF para preencher automaticamente.</small>
+          </div>
+
           <div>
             <label class="lbl">Desconto a conceder</label>
             <div class="row" id="discountRow" aria-label="Opções de desconto">
@@ -196,6 +206,17 @@
   <!-- 2) Captura e PDF (usados no app.js) -->
   <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.3.136/pdf.min.js" data-source="cdn-pdfjs"></script>
+  <script>
+    (function () {
+      const globalPdf = window.pdfjsLib || window['pdfjs-dist/build/pdf'];
+      if (!globalPdf) return;
+      window.pdfjsLib = globalPdf;
+      if (globalPdf.GlobalWorkerOptions) {
+        globalPdf.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.3.136/pdf.worker.min.js';
+      }
+    })();
+  </script>
   <!-- 3) Supabase SDK (usado no app.js) -->
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <!-- 4) Seu script principal (APENAS UMA VEZ) -->
