@@ -58,6 +58,166 @@ const unit = document.getElementById('unit');
 const err = document.getElementById('err');
 const resBox = document.getElementById('res');
 
+const billTrigger = document.getElementById('billTrigger');
+const billInput = document.getElementById('billUpload');
+const billFileName = document.getElementById('billFileName');
+const billStatus = document.getElementById('billStatus');
+const BILL_STATUS_DEFAULT = 'Envie a conta em PDF para preencher automaticamente.';
+
+function setBillStatus(text, state = 'muted'){
+  if (!billStatus) return;
+  billStatus.textContent = text;
+  billStatus.classList.remove('ok', 'error');
+  if (state === 'ok') billStatus.classList.add('ok');
+  if (state === 'error') billStatus.classList.add('error');
+}
+
+function formatLocaleNumber(n, digits){
+  return isFinite(n) ? n.toLocaleString('pt-BR',{minimumFractionDigits:digits,maximumFractionDigits:digits}) : '';
+}
+
+async function flateDecode(bytes){
+  if (typeof DecompressionStream === 'function'){
+    for (const format of ['deflate', 'deflate-raw']){
+      try {
+        const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream(format));
+        const buffer = await new Response(stream).arrayBuffer();
+        if (buffer.byteLength){
+          return new TextDecoder('utf-8').decode(buffer);
+        }
+      } catch (error) {
+        console.warn(`DecompressionStream ${format} falhou`, error);
+      }
+    }
+  }
+  throw new Error('Este navegador não suporta a leitura automática do PDF.');
+}
+
+async function extractPdfText(buffer){
+  const bytes = new Uint8Array(buffer);
+  const latin1Decoder = new TextDecoder('latin1');
+  const asciiSnapshot = latin1Decoder.decode(bytes);
+  const segments = [];
+  let hadCompressedStream = false;
+  let decodeFailed = false;
+  let decodeErrorMessage = '';
+  const streamRegex = /<<[\s\S]*?>>\s*stream\r?\n/g;
+  let match;
+  while ((match = streamRegex.exec(asciiSnapshot)) !== null){
+    const dict = match[0];
+    const hasFlate = /\/Filter\s*(?:\[[^\]]*\/FlateDecode[^\]]*\]|\/FlateDecode)/.test(dict);
+    const start = streamRegex.lastIndex;
+    const end = asciiSnapshot.indexOf('endstream', start);
+    if (end === -1) break;
+    let startIndex = start;
+    if (bytes[startIndex] === 0x0d && bytes[startIndex + 1] === 0x0a) startIndex += 2;
+    else if (bytes[startIndex] === 0x0a || bytes[startIndex] === 0x0d) startIndex += 1;
+    let endIndex = end;
+    while (endIndex > startIndex && (bytes[endIndex - 1] === 0x0d || bytes[endIndex - 1] === 0x0a)) endIndex--;
+    let chunk = bytes.slice(startIndex, endIndex);
+    if (!chunk.length) continue;
+    let textChunk = '';
+    try {
+      if (hasFlate){
+        hadCompressedStream = true;
+        textChunk = await flateDecode(chunk);
+      } else {
+        textChunk = latin1Decoder.decode(chunk);
+      }
+    } catch (error) {
+      decodeFailed = true;
+      if (!decodeErrorMessage && error && error.message) decodeErrorMessage = String(error.message);
+      console.warn('Falha ao decodificar parte do PDF', error);
+      continue;
+    }
+    if (textChunk) segments.push(textChunk.replace(/\0/g, ' '));
+  }
+  if (!segments.length) segments.push(asciiSnapshot.replace(/\0/g, ' '));
+  return {
+    text: segments.join(' '),
+    hadCompressedStream,
+    decodeFailed,
+    decodeErrorMessage
+  };
+}
+
+function normalizeAccents(str){
+  return str.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
+async function extractBillValues(file){
+  const buffer = await file.arrayBuffer();
+  const { text, hadCompressedStream, decodeFailed, decodeErrorMessage } = await extractPdfText(buffer);
+  const rawText = text.replace(/\s+/g, ' ').trim();
+  if (!rawText && hadCompressedStream && decodeFailed){
+    const fallbackMsg = decodeErrorMessage || 'Não foi possível extrair o texto comprimido do PDF neste navegador. Use um navegador atualizado (Chrome ou Edge) ou informe os valores manualmente.';
+    throw new Error(fallbackMsg);
+  }
+  if (!rawText){
+    throw new Error('Não foi possível ler o conteúdo do PDF.');
+  }
+  const upper = rawText.toUpperCase();
+  let idx = upper.indexOf('INJEÇÃO SCEE');
+  let sourceForSlice = rawText;
+  if (idx === -1){
+    const withoutAccents = normalizeAccents(rawText);
+    idx = withoutAccents.toUpperCase().indexOf('INJECAO SCEE');
+    sourceForSlice = withoutAccents;
+  }
+  if (idx === -1) throw new Error('Linha de INJEÇÃO SCEE não encontrada.');
+  const snippet = sourceForSlice.slice(Math.max(0, idx - 40), idx + 220);
+  const lowerSnippet = snippet.toLowerCase();
+  const afterIndex = lowerSnippet.indexOf('kwh');
+  const numberPattern = /(\d{1,3}(?:\.\d{3})*,\d+|\d+(?:\.\d+)?)/g;
+  let kwhStr = '';
+  let priceStr = '';
+  if (afterIndex !== -1){
+    const after = snippet.slice(afterIndex + 3);
+    const numbers = [...after.matchAll(numberPattern)].map(m=>m[1] || m[0]);
+    if (numbers.length) kwhStr = numbers[0];
+    if (numbers.length > 1) priceStr = numbers[1];
+  }
+  if (!kwhStr || !priceStr){
+    const allNumbers = [...snippet.matchAll(numberPattern)].map(m=>m[1] || m[0])
+      .filter(n => n.replace(/\D/g,'').length <= 8 || n.includes(',') || n.includes('.'));
+    if (!kwhStr && allNumbers.length >= 2) kwhStr = allNumbers[allNumbers.length - 2];
+    if (!priceStr && allNumbers.length >= 1) priceStr = allNumbers[allNumbers.length - 1];
+  }
+  const kwhNum = toNumber(kwhStr);
+  const priceNum = toNumber(priceStr);
+  if (!isFinite(kwhNum)) throw new Error('Valor de kWh não identificado.');
+  if (!isFinite(priceNum)) throw new Error('Valor unitário não identificado.');
+  return { kwh: kwhNum, price: priceNum };
+}
+
+if (billTrigger && billInput){
+  billTrigger.addEventListener('click', ()=> billInput.click());
+}
+
+if (billInput){
+  billInput.addEventListener('change', async ()=>{
+    const file = billInput.files && billInput.files[0];
+    if (!file){
+      if (billFileName) billFileName.textContent = 'Nenhum arquivo selecionado';
+      setBillStatus(BILL_STATUS_DEFAULT);
+      return;
+    }
+    if (billFileName) billFileName.textContent = file.name;
+    setBillStatus('Lendo PDF, aguarde...');
+    try {
+      const { kwh, price } = await extractBillValues(file);
+      inj.value = formatLocaleNumber(kwh, 2);
+      unit.value = formatLocaleNumber(price, 6);
+      calculate();
+      setBillStatus('Valores preenchidos com sucesso!', 'ok');
+      billInput.value = '';
+    } catch (error) {
+      console.error('PDF parse error:', error);
+      setBillStatus(error.message || 'Não foi possível ler o PDF.', 'error');
+    }
+  });
+}
+
 const vBase = document.getElementById('vBase');
 const vPct = document.getElementById('vPct');
 const vDesc = document.getElementById('vDesc');
@@ -211,6 +371,9 @@ clearBtn.addEventListener('click', ()=>{
   err.classList.remove('show'); resBox.hidden=true;
   sInj.textContent='—'; sUnit.textContent='—'; sPct.textContent='—'; sFinal.textContent=fmtBRL(0);
   qrcodeBox.innerHTML=''; qrArea.classList.add('hidden'); qrPayload.value='';
+  if (billInput) billInput.value='';
+  if (billFileName) billFileName.textContent='Nenhum arquivo selecionado';
+  setBillStatus(BILL_STATUS_DEFAULT);
 });
 
 /* ==========================
