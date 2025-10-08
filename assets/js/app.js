@@ -1,3 +1,7 @@
+sb.auth.onAuthStateChange((event, session) => {
+  console.log('Supabase auth state:', event, session?.user?.id || 'No user');
+});
+
 // ===== Supabase =====
 const SUPABASE_URL = 'https://qlgzktpcwlpyeqfkcaut.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFsZ3prdHBjd2xweWVxZmtjYXV0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTk4NjYxMjIsImV4cCI6MjA3NTQ0MjEyMn0.Zuo9F2lo6rkhopeMAITWUBSNuobWti_ai0YDrhJWklE';
@@ -445,3 +449,4 @@ deleteAccountBtn.addEventListener('click', async ()=>{
   alert('Conta excluída.');
 
 });
+
