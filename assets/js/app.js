@@ -168,7 +168,9 @@ async function extractBillValues(file){
   const anchors = [
     { term: 'INJEÇÃO SCEE', normalized: 'INJECAO SCEE' },
     { term: 'CRÉDITO RECEBIDO', normalized: 'CREDITO RECEBIDO' },
-    { term: 'CREDITO RECEBIDO', normalized: 'CREDITO RECEBIDO' }
+    { term: 'CREDITO RECEBIDO', normalized: 'CREDITO RECEBIDO' },
+    { term: '(CRÉDITO RECEBIDO)', normalized: '(CREDITO RECEBIDO)' },
+    { term: '(CREDITO RECEBIDO)', normalized: '(CREDITO RECEBIDO)' }
   ];
 
   let snippet = '';
@@ -186,7 +188,16 @@ async function extractBillValues(file){
   }
 
   if (!snippet){
-    throw new Error('Linha de INJEÇÃO SCEE ou CRÉDITO RECEBIDO não encontrada.');
+    const fallbackMatch = rawText.match(/KWH[^\d]*[\d.,]+/i);
+    if (fallbackMatch){
+      const idx = fallbackMatch.index ?? rawText.indexOf(fallbackMatch[0]);
+      const start = Math.max(0, idx - 120);
+      snippet = rawText.slice(start, start + 320);
+    }
+  }
+
+  if (!snippet){
+    throw new Error('Linha de INJEÇÃO SCEE, CRÉDITO RECEBIDO ou campo KWh não encontrada.');
   }
 
   const numberPattern = /(\d{1,3}(?:\.\d{3})*,\d+|\d+(?:\.\d+)?)/g;
