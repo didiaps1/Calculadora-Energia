@@ -119,6 +119,7 @@ function formatLocaleNumber(n, digits){
 
 async function extractBillValues(file){
   const pdfjs = await ensurePdfjs();
+  const pdfjs = window.pdfjsLib;
   if (!pdfjs) throw new Error('Leitor de PDF não carregado.');
   const buffer = await file.arrayBuffer();
   const pdf = await pdfjs.getDocument({ data: buffer }).promise;
