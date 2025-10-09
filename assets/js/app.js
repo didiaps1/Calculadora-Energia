@@ -3,16 +3,22 @@
    ========================== */
 const SUPABASE_URL = 'https://qlgzktpcwlpyeqfkcaut.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFsZ3prdHBjd2xweWVxZmtjYXV0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTk4NjYxMjIsImV4cCI6MjA3NTQ0MjEyMn0.Zuo9F2lo6rkhopeMAITWUBSNuobWti_ai0YDrhJWklE';
-const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const supabaseLib = typeof window !== 'undefined' ? window.supabase : undefined;
+const hasSupabaseSDK = !!(supabaseLib && typeof supabaseLib.createClient === 'function');
+const sb = hasSupabaseSDK ? supabaseLib.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
 
-// Listener de auth state
-sb.auth.onAuthStateChange((event, session) => {
-  console.log('Supabase auth state:', event, session?.user?.id || 'No user');
-});
+if (sb) {
+  sb.auth.onAuthStateChange((event, session) => {
+    console.log('Supabase auth state:', event, session?.user?.id || 'No user');
+  });
+} else {
+  console.warn('Supabase SDK não carregou; recursos de contas salvas foram desativados.');
+}
 
 // login anônimo (gera um user_id por navegador)
 let currentUser = null;
 async function ensureAuth() {
+  if (!sb) return null;
   try {
     const { data: { user } } = await sb.auth.getUser();
     if (user) { 
@@ -49,6 +55,7 @@ function toNumber(str){
 }
 const fmtBRL = n => new Intl.NumberFormat('pt-BR',{style:'currency',currency:'BRL'}).format(isFinite(n)?n:0);
 const clamp = (v,min,max)=>Math.min(Math.max(v,min),max);
+const FIXED_ENERGY_FEE = 30;
 
 /* ==========================
    Elementos principais
@@ -57,6 +64,759 @@ const inj = document.getElementById('inj');
 const unit = document.getElementById('unit');
 const err = document.getElementById('err');
 const resBox = document.getElementById('res');
+
+const billTrigger = document.getElementById('billTrigger');
+const billInput = document.getElementById('billUpload');
+const billFileName = document.getElementById('billFileName');
+const billStatus = document.getElementById('billStatus');
+const BILL_STATUS_DEFAULT = 'Envie a conta em PDF para preencher automaticamente.';
+
+function setBillStatus(text, state = 'muted'){
+  if (!billStatus) return;
+  billStatus.textContent = text;
+  billStatus.classList.remove('ok', 'error');
+  if (state === 'ok') billStatus.classList.add('ok');
+  if (state === 'error') billStatus.classList.add('error');
+}
+
+function formatLocaleNumber(n, digits){
+  return isFinite(n) ? n.toLocaleString('pt-BR',{minimumFractionDigits:digits,maximumFractionDigits:digits}) : '';
+}
+
+function findNumberInText(text){
+  if (!text) return null;
+  const match = String(text).match(/-?\d{1,3}(?:\.\d{3})*,\d+|-?\d+(?:\.\d+)?/);
+  if (!match) return null;
+  const raw = match[0];
+  const value = toNumber(raw);
+  if (!isFinite(value)) return null;
+  return { raw, value };
+}
+
+function getDecimalCount(raw){
+  if (!raw) return 0;
+  const match = String(raw).match(/[.,](\d+)/);
+  return match ? match[1].length : 0;
+}
+
+function isProbableUnitPrice(candidate){
+  if (!candidate || !isFinite(candidate.value)) return false;
+  const value = candidate.value;
+  if (value <= 0) return false;
+  if (value >= 15) return false;
+  if (value < 0.05) return false;
+  const decimals = getDecimalCount(candidate.raw);
+  if (decimals >= 4) return true;
+  if (value < 2 && decimals >= 2) return true;
+  if (value < 5 && decimals >= 3) return true;
+  if (value < 3 && decimals >= 2) return true;
+  return false;
+}
+
+function scorePriceCandidate(candidate, { distance = 0, fromLabel = false, hasCurrency = false, sequenceIndex = 0, isPriceLabel = false, isTarifa = false } = {}){
+  if (!candidate || !isFinite(candidate.value)) return -Infinity;
+  const decimals = getDecimalCount(candidate.raw);
+  let score = 0;
+  if (fromLabel) score += 60;
+  if (isPriceLabel) score += 45;
+  if (isTarifa) score -= 55;
+  if (hasCurrency) score += 15;
+  if (decimals >= 4) score += 30;
+  else if (decimals === 3) score += 18;
+  else if (decimals === 2) score += 6;
+  if (candidate.value > 0 && candidate.value < 5) score += 35;
+  else if (candidate.value >= 5 && candidate.value < 10) score += 12;
+  else if (candidate.value >= 10 && candidate.value < 20) score -= 12;
+  else if (candidate.value >= 20) score -= 45;
+  if (!isProbableUnitPrice(candidate) && !hasCurrency) score -= 40;
+  score -= distance * 1.5;
+  score -= sequenceIndex * 0.1;
+  return score;
+}
+
+async function flateDecode(bytes){
+  if (typeof DecompressionStream === 'function'){
+    for (const format of ['deflate', 'deflate-raw']){
+      try {
+        const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream(format));
+        const buffer = await new Response(stream).arrayBuffer();
+        if (buffer.byteLength){
+          return new TextDecoder('utf-8').decode(buffer);
+        }
+      } catch (error) {
+        console.warn(`DecompressionStream ${format} falhou`, error);
+      }
+    }
+  }
+  throw new Error('Este navegador não suporta a leitura automática do PDF.');
+}
+
+function decodePdfLiteralString(source, startIndex){
+  const chars = [];
+  let i = startIndex;
+  while (i < source.length){
+    const ch = source[i];
+    if (ch === ')'){
+      return { value: chars.join(''), nextIndex: i + 1 };
+    }
+    if (ch === '\\'){
+      const next = source[i + 1];
+      if (next === undefined){
+        return { value: chars.join(''), nextIndex: source.length };
+      }
+      if (/^[0-7]$/.test(next)){
+        let oct = next;
+        let consumed = 1;
+        for (let j = 2; j <= 3 && /^[0-7]$/.test(source[i + j]); j++){
+          oct += source[i + j];
+          consumed++;
+        }
+        chars.push(String.fromCharCode(parseInt(oct, 8)));
+        i += consumed + 1;
+        continue;
+      }
+      const map = { n: '\n', r: '\r', t: '\t', b: '\b', f: '\f', '(': '(', ')': ')', '\\': '\\' };
+      chars.push(map[next] ?? next);
+      i += 2;
+      continue;
+    }
+    chars.push(ch);
+    i++;
+  }
+  return { value: chars.join(''), nextIndex: source.length };
+}
+
+function decodePdfHexString(source, startIndex){
+  let i = startIndex;
+  let hex = '';
+  while (i < source.length){
+    const ch = source[i];
+    if (ch === '>'){
+      break;
+    }
+    if (!/\s/.test(ch)){
+      hex += ch;
+    }
+    i++;
+  }
+  if (hex.length % 2 === 1){
+    hex += '0';
+  }
+  let value = '';
+  for (let j = 0; j < hex.length; j += 2){
+    const code = parseInt(hex.slice(j, j + 2), 16);
+    value += String.fromCharCode(code);
+  }
+  if (value.length >= 2 && value.charCodeAt(0) === 0xFE && value.charCodeAt(1) === 0xFF){
+    let decoded = '';
+    for (let k = 2; k < value.length; k += 2){
+      decoded += String.fromCharCode((value.charCodeAt(k) << 8) + (value.charCodeAt(k + 1) || 0));
+    }
+    value = decoded;
+  }
+  return { value, nextIndex: i + 1 };
+}
+
+function sanitizePdfString(raw){
+  let value = raw;
+  if (value.length >= 2 && value.charCodeAt(0) === 0xFE && value.charCodeAt(1) === 0xFF){
+    let decoded = '';
+    for (let i = 2; i < value.length; i += 2){
+      decoded += String.fromCharCode((value.charCodeAt(i) << 8) + (value.charCodeAt(i + 1) || 0));
+    }
+    value = decoded;
+  }
+  return value.replace(/[\r\n]+/g, ' ').trim();
+}
+
+function collectPdfStringsInto(content, target){
+  for (let i = 0; i < content.length; i++){
+    const ch = content[i];
+    if (ch === '('){
+      const { value, nextIndex } = decodePdfLiteralString(content, i + 1);
+      const sanitized = value ? sanitizePdfString(value) : '';
+      if (sanitized) target.push(sanitized);
+      i = nextIndex - 1;
+    } else if (ch === '<' && content[i + 1] !== '<'){
+      const { value, nextIndex } = decodePdfHexString(content, i + 1);
+      const sanitized = value ? sanitizePdfString(value) : '';
+      if (sanitized) target.push(sanitized);
+      i = nextIndex - 1;
+    }
+  }
+  return target;
+}
+
+async function extractPdfText(buffer){
+  const bytes = new Uint8Array(buffer);
+  const latin1Decoder = new TextDecoder('latin1');
+  const asciiSnapshot = latin1Decoder.decode(bytes);
+  const segments = [];
+  const stringTokens = [];
+  let hadCompressedStream = false;
+  let decodeFailed = false;
+  let decodeErrorMessage = '';
+  const streamRegex = /<<[\s\S]*?>>\s*stream\r?\n/g;
+  let match;
+  while ((match = streamRegex.exec(asciiSnapshot)) !== null){
+    const dict = match[0];
+    const hasFlate = /\/Filter\s*(?:\[[^\]]*\/FlateDecode[^\]]*\]|\/FlateDecode)/.test(dict);
+    const start = streamRegex.lastIndex;
+    const end = asciiSnapshot.indexOf('endstream', start);
+    if (end === -1) break;
+    let startIndex = start;
+    if (bytes[startIndex] === 0x0d && bytes[startIndex + 1] === 0x0a) startIndex += 2;
+    else if (bytes[startIndex] === 0x0a || bytes[startIndex] === 0x0d) startIndex += 1;
+    let endIndex = end;
+    while (endIndex > startIndex && (bytes[endIndex - 1] === 0x0d || bytes[endIndex - 1] === 0x0a)) endIndex--;
+    const chunk = bytes.slice(startIndex, endIndex);
+    if (!chunk.length) continue;
+    let textChunk = '';
+    try {
+      if (hasFlate){
+        hadCompressedStream = true;
+        textChunk = await flateDecode(chunk);
+      } else {
+        textChunk = latin1Decoder.decode(chunk);
+      }
+    } catch (error) {
+      decodeFailed = true;
+      if (!decodeErrorMessage && error && error.message) decodeErrorMessage = String(error.message);
+      console.warn('Falha ao decodificar parte do PDF', error);
+      continue;
+    }
+    if (textChunk){
+      const cleaned = textChunk.replace(/\0/g, ' ');
+      segments.push(cleaned);
+      collectPdfStringsInto(cleaned, stringTokens);
+    }
+  }
+  if (!segments.length){
+    const fallback = asciiSnapshot.replace(/\0/g, ' ');
+    segments.push(fallback);
+    collectPdfStringsInto(fallback, stringTokens);
+  }
+  const joinedText = segments.join(' ');
+  const joinedSnippets = stringTokens.join(' ');
+  return {
+    text: joinedText,
+    extractedStrings: joinedSnippets,
+    tokens: stringTokens,
+    hadCompressedStream,
+    decodeFailed,
+    decodeErrorMessage
+  };
+}
+
+function normalizeAccents(str){
+  if (!str) return '';
+  return str.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
+async function extractBillValues(file){
+  const buffer = await file.arrayBuffer();
+  const { text, extractedStrings, tokens, hadCompressedStream, decodeFailed, decodeErrorMessage } = await extractPdfText(buffer);
+  const sourceText = extractedStrings && extractedStrings.length > 40 ? extractedStrings : text;
+  const rawText = sourceText.replace(/\s+/g, ' ').trim();
+  if (!rawText && hadCompressedStream && decodeFailed){
+    const fallbackMsg = decodeErrorMessage || 'Não foi possível extrair o texto comprimido do PDF neste navegador. Use um navegador atualizado (Chrome ou Edge) ou informe os valores manualmente.';
+    throw new Error(fallbackMsg);
+  }
+  if (!rawText){
+    throw new Error('Não foi possível ler o conteúdo do PDF.');
+  }
+
+  const anchors = [
+    { term: 'INJEÇÃO SCEE', normalized: 'INJECAO SCEE' },
+    { term: 'CRÉDITO RECEBIDO', normalized: 'CREDITO RECEBIDO' },
+    { term: 'CREDITO RECEBIDO', normalized: 'CREDITO RECEBIDO' },
+    { term: '(CRÉDITO RECEBIDO)', normalized: '(CREDITO RECEBIDO)' },
+    { term: '(CREDITO RECEBIDO)', normalized: '(CREDITO RECEBIDO)' }
+  ];
+
+  const tokenData = (tokens || []).map((raw, index) => {
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    const normalized = normalizeAccents(trimmed);
+    return {
+      raw: trimmed,
+      upper: trimmed.toUpperCase(),
+      normalized,
+      upperNormalized: normalized.toUpperCase(),
+      index
+    };
+  }).filter(Boolean);
+
+  let anchorTokenIndex = -1;
+  outerAnchor:
+  for (const anchor of anchors){
+    const idx = tokenData.findIndex(token =>
+      token.upper.includes(anchor.term) || token.upperNormalized.includes(anchor.normalized)
+    );
+    if (idx !== -1){
+      anchorTokenIndex = idx;
+      break outerAnchor;
+    }
+  }
+  if (anchorTokenIndex === -1){
+    outerCombined:
+    for (const anchor of anchors){
+      for (let i = 0; i < tokenData.length - 1; i++){
+        const combined = `${tokenData[i].upperNormalized} ${tokenData[i + 1].upperNormalized}`;
+        if (combined.includes(anchor.normalized)){
+          anchorTokenIndex = i;
+          break outerCombined;
+        }
+      }
+    }
+  }
+
+  const snippetFromTokens = anchorTokenIndex !== -1 && tokenData.length
+    ? tokenData.slice(Math.max(0, anchorTokenIndex - 6), Math.min(tokenData.length, anchorTokenIndex + 30)).map(t => t.raw).join(' ')
+    : '';
+
+  let kwhCandidate = null;
+  let kwhTokenIndex = -1;
+  if (tokenData.length){
+    const kwhCandidates = [];
+    tokenData.forEach((token, idx) => {
+      if (!token.upperNormalized.includes('KWH')) return;
+      let candidate = findNumberInText(token.raw);
+      let candidateIndex = idx;
+      if (!candidate || candidate.value < 1){
+        for (let j = idx + 1; j < tokenData.length && j <= idx + 4; j++){
+          const lookahead = findNumberInText(tokenData[j].raw);
+          if (lookahead && lookahead.value >= 1){
+            candidate = lookahead;
+            candidateIndex = j;
+            break;
+          }
+        }
+      }
+      if (candidate && candidate.value >= 1){
+        const distance = anchorTokenIndex !== -1 ? Math.abs(candidateIndex - anchorTokenIndex) : 0;
+        kwhCandidates.push({ candidate, index: candidateIndex, distance });
+      }
+    });
+    if (kwhCandidates.length){
+      kwhCandidates.sort((a, b) => {
+        if (anchorTokenIndex !== -1 && a.distance !== b.distance){
+          return a.distance - b.distance;
+        }
+        return a.index - b.index;
+      });
+      kwhCandidate = kwhCandidates[0].candidate;
+      kwhTokenIndex = kwhCandidates[0].index;
+    }
+  }
+
+  let priceCandidate = null;
+  if (tokenData.length){
+    const referenceIndex = kwhTokenIndex !== -1 ? kwhTokenIndex : (anchorTokenIndex !== -1 ? anchorTokenIndex : 0);
+    const priceCandidates = [];
+    const maxIndex = Math.min(tokenData.length, referenceIndex + 80);
+
+    const computeContextFlags = (position) => {
+      const windowStart = Math.max(0, position - 4);
+      const contextTokens = tokenData.slice(windowStart, Math.min(tokenData.length, position + 1));
+      const contextText = contextTokens.map(t => t.upperNormalized).join(' ');
+      return {
+        hasPriceLabel: contextText.includes('PRECO') && contextText.includes('UNIT'),
+        hasTarifaLabel: contextText.includes('TARIFA')
+      };
+    };
+
+    const pushCandidate = (number, index, opts = {}) => {
+      if (!number || !isFinite(number.value) || number.value <= 0) return;
+      if (kwhCandidate && number.value === kwhCandidate.value && Math.abs(index - kwhTokenIndex) <= 1) return;
+      const distance = Math.abs(index - referenceIndex);
+      const { hasPriceLabel, hasTarifaLabel } = opts.hasPriceLabel === undefined && opts.hasTarifaLabel === undefined
+        ? computeContextFlags(index)
+        : { hasPriceLabel: !!opts.hasPriceLabel, hasTarifaLabel: !!opts.hasTarifaLabel };
+      priceCandidates.push({
+        number,
+        index,
+        distance,
+        fromLabel: !!opts.fromLabel,
+        hasCurrency: !!opts.hasCurrency,
+        hasPriceLabel,
+        hasTarifaLabel
+      });
+    };
+
+    if (kwhTokenIndex !== -1){
+      const adjacencyCandidates = [];
+      for (let i = kwhTokenIndex + 1; i < tokenData.length && i <= kwhTokenIndex + 16; i++){
+        const token = tokenData[i];
+        const normalized = token.upperNormalized;
+        const number = findNumberInText(token.raw);
+        if (!number) continue;
+        if (Math.abs(number.value - (kwhCandidate?.value ?? NaN)) < 1e-6) continue;
+        if (number.value <= 0) continue;
+        if (number.value >= 20) continue;
+        const hasCurrency = token.raw.includes('R$') || normalized.includes('RS');
+        const contextTokens = tokenData.slice(Math.max(kwhTokenIndex + 1, i - 4), i + 1);
+        const contextText = contextTokens.map(t => t.upperNormalized).join(' ');
+        const hasPriceLabel = contextText.includes('PRECO') && contextText.includes('UNIT');
+        const hasTarifaLabel = contextText.includes('TARIFA');
+        const candidateInfo = {
+          number,
+          index: i,
+          hasCurrency,
+          hasPriceLabel,
+          hasTarifaLabel
+        };
+        if (hasPriceLabel || hasCurrency || isProbableUnitPrice(number)){
+          adjacencyCandidates.push(candidateInfo);
+        } else if (!hasTarifaLabel && number.value < 10){
+          adjacencyCandidates.push({ ...candidateInfo, weak: true });
+        }
+      }
+      if (adjacencyCandidates.length){
+        const highPrecision = adjacencyCandidates.filter(candidate =>
+          getDecimalCount(candidate.number.raw) >= 5 && !candidate.hasTarifaLabel
+        );
+        if (highPrecision.length){
+          priceCandidate = highPrecision[0].number;
+        } else {
+          const priceLabelCandidate = adjacencyCandidates.find(candidate =>
+            candidate.hasPriceLabel && !candidate.hasTarifaLabel && isProbableUnitPrice(candidate.number)
+          );
+          if (priceLabelCandidate){
+            priceCandidate = priceLabelCandidate.number;
+          } else {
+            const filtered = adjacencyCandidates.filter(candidate =>
+              !candidate.hasTarifaLabel && isProbableUnitPrice(candidate.number)
+            );
+            if (filtered.length){
+              priceCandidate = filtered[0].number;
+            } else {
+              const firstValid = adjacencyCandidates.find(candidate => !candidate.hasTarifaLabel) || adjacencyCandidates[0];
+              if (firstValid) priceCandidate = firstValid.number;
+            }
+          }
+        }
+      }
+    }
+
+    if (!priceCandidate){
+      for (let i = referenceIndex; i < maxIndex; i++){
+        const token = tokenData[i];
+        const normalized = token.upperNormalized;
+        const number = findNumberInText(token.raw);
+        const hasCurrency = token.raw.includes('R$') || normalized.includes('RS');
+        const isPriceLabel = normalized.includes('PRECO') && normalized.includes('UNIT');
+
+        if (isPriceLabel){
+          for (let j = i + 1; j < tokenData.length && j <= i + 6; j++){
+            const lookahead = findNumberInText(tokenData[j].raw);
+            const lookaheadCurrency = tokenData[j].raw.includes('R$') || tokenData[j].upperNormalized.includes('RS');
+            pushCandidate(lookahead, j, { fromLabel: true, hasCurrency: lookaheadCurrency, hasPriceLabel: true });
+          }
+        }
+
+        pushCandidate(number, i, { hasCurrency });
+      }
+
+      if (priceCandidates.length){
+        let best = null;
+        priceCandidates.forEach((candidate, seqIdx) => {
+          const score = scorePriceCandidate(candidate.number, {
+            distance: candidate.distance,
+            fromLabel: candidate.fromLabel,
+            hasCurrency: candidate.hasCurrency,
+            sequenceIndex: seqIdx,
+            isPriceLabel: candidate.hasPriceLabel,
+            isTarifa: candidate.hasTarifaLabel
+          });
+          if (!best || score > best.score || (score === best.score && candidate.distance < best.distance)){
+            best = { ...candidate, score };
+          }
+        });
+        if (best) priceCandidate = best.number;
+      }
+    }
+  }
+
+  const normalized = normalizeAccents(rawText);
+  const upper = rawText.toUpperCase();
+  const upperNormalized = normalized.toUpperCase();
+
+  const computeGlobalCandidateScore = (candidate) => {
+    if (!candidate || !isFinite(candidate.value)){
+      return { score: -Infinity, hasCurrency: false, isPriceLabel: false, isTarifa: false };
+    }
+    const rawCandidate = candidate.raw;
+    let base = rawText;
+    let baseUpper = upper;
+    let idx = base.indexOf(rawCandidate);
+    if (idx === -1){
+      base = normalized;
+      baseUpper = upperNormalized;
+      idx = base.indexOf(rawCandidate);
+    }
+    if (idx === -1){
+      return { score: scorePriceCandidate(candidate, { distance: 3, sequenceIndex: 9 }), hasCurrency: false, isPriceLabel: false, isTarifa: false };
+    }
+    const contextStart = Math.max(0, idx - 120);
+    const contextEnd = Math.min(base.length, idx + rawCandidate.length + 120);
+    const contextUpper = baseUpper.slice(contextStart, contextEnd);
+    const hasCurrency = contextUpper.includes('R$') || contextUpper.includes('RS');
+    const isPriceLabel = contextUpper.includes('PRECO') && contextUpper.includes('UNIT');
+    const isTarifa = contextUpper.includes('TARIFA');
+    const score = scorePriceCandidate(candidate, {
+      distance: 0,
+      sequenceIndex: 0,
+      hasCurrency,
+      isPriceLabel,
+      isTarifa
+    });
+    return { score, hasCurrency, isPriceLabel, isTarifa };
+  };
+
+  function buildSnippetFromText(){
+    for (const anchor of anchors){
+      let idx = upper.indexOf(anchor.term);
+      let base = rawText;
+      if (idx === -1){
+        idx = upperNormalized.indexOf(anchor.normalized);
+        base = normalized;
+      }
+      if (idx !== -1){
+        return base.slice(Math.max(0, idx - 80), idx + 260);
+      }
+    }
+    return '';
+  }
+
+  function extractFromSnippet(snippetText){
+    if (!snippetText) return { kwh: null, price: null, priceMeta: null };
+    const snippetNormalized = normalizeAccents(snippetText);
+    const snippetUpper = snippetNormalized.toUpperCase();
+    const numberPattern = /(\d{1,3}(?:\.\d{3})*,\d+|\d+(?:\.\d+)?)/g;
+    const numberMatches = [...snippetText.matchAll(numberPattern)].map(match => ({
+      raw: match[1] || match[0],
+      value: toNumber(match[1] || match[0]),
+      index: match.index ?? snippetText.indexOf(match[0])
+    })).filter(entry => isFinite(entry.value));
+
+    const kwhFromTag = (() => {
+      const match = snippetUpper.match(/KWH[^\d]*([\d.,]+)/i);
+      if (!match) return null;
+      return { raw: match[1], value: toNumber(match[1]) };
+    })();
+
+    let kwh = kwhFromTag;
+    if (!kwh){
+      kwh = numberMatches.find(entry => entry.value >= 1) || null;
+    }
+
+    let price = null;
+    let priceMeta = null;
+    if (kwh){
+      const idx = numberMatches.findIndex(entry => entry.raw === kwh.raw || entry.value === kwh.value);
+      if (idx !== -1){
+        const after = numberMatches.slice(idx + 1);
+        const ordered = after.map((entry, seqIdx) => {
+          const contextStart = Math.max(0, entry.index - 60);
+          const contextEnd = Math.min(snippetUpper.length, entry.index + (entry.raw?.length || 0) + 60);
+          const context = snippetUpper.slice(contextStart, contextEnd);
+          const hasTarifaContext = context.includes('TARIFA');
+          const hasPriceContext = context.includes('PRECO') && context.includes('UNIT');
+          const hasCurrencyContext = context.includes('R$') || context.includes('RS');
+          return {
+            entry,
+            seqIdx,
+            hasTarifaContext,
+            hasPriceContext,
+            hasCurrencyContext,
+            distance: seqIdx + 1
+          };
+        });
+
+        const preferred = ordered.find(candidate =>
+          candidate && candidate.hasPriceContext && !candidate.hasTarifaContext && isProbableUnitPrice(candidate.entry)
+        );
+        if (preferred){
+          price = preferred.entry;
+          priceMeta = {
+            hasPriceLabel: preferred.hasPriceContext,
+            hasTarifaLabel: preferred.hasTarifaContext,
+            hasCurrency: preferred.hasCurrencyContext,
+            sequenceIndex: preferred.seqIdx,
+            source: 'preferred'
+          };
+        } else {
+          const viable = ordered.find(candidate =>
+            candidate && !candidate.hasTarifaContext && isProbableUnitPrice(candidate.entry)
+          );
+          if (viable){
+            price = viable.entry;
+            priceMeta = {
+              hasPriceLabel: viable.hasPriceContext,
+              hasTarifaLabel: viable.hasTarifaContext,
+              hasCurrency: viable.hasCurrencyContext,
+              sequenceIndex: viable.seqIdx,
+              source: 'adjacent'
+            };
+          } else {
+            let best = null;
+            ordered.forEach(candidate => {
+              const score = scorePriceCandidate(candidate.entry, {
+                distance: candidate.distance,
+                sequenceIndex: candidate.seqIdx,
+                isPriceLabel: candidate.hasPriceContext,
+                isTarifa: candidate.hasTarifaContext,
+                hasCurrency: candidate.hasCurrencyContext
+              });
+              if (!best || score > best.score){
+                best = { entry: candidate.entry, score, meta: candidate };
+              }
+            });
+            if (best){
+              price = best.entry;
+              priceMeta = {
+                hasPriceLabel: best.meta?.hasPriceContext,
+                hasTarifaLabel: best.meta?.hasTarifaContext,
+                hasCurrency: best.meta?.hasCurrencyContext,
+                sequenceIndex: best.meta?.seqIdx,
+                source: 'scored'
+              };
+            }
+          }
+        }
+      }
+    }
+    if (!price){
+      const match = snippetUpper.match(/(?:PRECO\s*UNIT[^\d]*|R\$[^\d]*)\s*([\d.,]+)/i);
+      if (match){
+        const value = toNumber(match[1]);
+        if (isFinite(value)){
+          const candidate = { raw: match[1], value };
+          if (isProbableUnitPrice(candidate)){
+            price = candidate;
+            priceMeta = { hasPriceLabel: true, hasTarifaLabel: false, hasCurrency: true, source: 'regex' };
+          }
+        }
+      }
+    }
+    if (!price){
+      let best = null;
+      numberMatches.forEach((entry, seqIdx) => {
+        const contextStart = Math.max(0, entry.index - 40);
+        const contextEnd = Math.min(snippetUpper.length, entry.index + (entry.raw?.length || 0) + 40);
+        const context = snippetUpper.slice(contextStart, contextEnd);
+        const score = scorePriceCandidate(entry, {
+          distance: seqIdx + 1,
+          sequenceIndex: seqIdx,
+          isPriceLabel: context.includes('PRECO') && context.includes('UNIT'),
+          isTarifa: context.includes('TARIFA'),
+          hasCurrency: context.includes('R$') || context.includes('RS')
+        });
+        if (!best || score > best.score){
+          best = { entry, score, context };
+        }
+      });
+      if (best && isProbableUnitPrice(best.entry)){
+        price = best.entry;
+        priceMeta = {
+          hasPriceLabel: best.context.includes('PRECO') && best.context.includes('UNIT'),
+          hasTarifaLabel: best.context.includes('TARIFA'),
+          hasCurrency: best.context.includes('R$') || best.context.includes('RS'),
+          source: 'fallback'
+        };
+      }
+    }
+
+    if (price && !isProbableUnitPrice(price)) price = null;
+
+    return { kwh, price, priceMeta };
+  }
+
+  const needSnippet = !kwhCandidate || !priceCandidate;
+  let snippet = snippetFromTokens;
+  if ((!snippet || !snippet.trim()) && needSnippet){
+    snippet = buildSnippetFromText();
+  }
+  if ((!snippet || !snippet.trim()) && needSnippet){
+    const fallbackMatch = rawText.match(/KWH[^\d]*[\d.,]+/i);
+    if (fallbackMatch){
+      const idx = fallbackMatch.index ?? rawText.indexOf(fallbackMatch[0]);
+      const start = Math.max(0, idx - 120);
+      snippet = rawText.slice(start, start + 320);
+    }
+  }
+
+  if ((!snippet || !snippet.trim()) && needSnippet){
+    throw new Error('Não foi possível localizar os campos de crédito no PDF. Informe os valores manualmente ou envie o arquivo completo.');
+  }
+
+  const snippetExtraction = snippet ? extractFromSnippet(snippet) : { kwh: null, price: null, priceMeta: null };
+  if (!kwhCandidate && snippetExtraction.kwh) kwhCandidate = snippetExtraction.kwh;
+
+  const snippetPriceCandidate = snippetExtraction.price && isProbableUnitPrice(snippetExtraction.price)
+    ? snippetExtraction.price
+    : null;
+
+  if (snippetPriceCandidate){
+    const snippetScoreLocal = scorePriceCandidate(snippetPriceCandidate, {
+      distance: snippetExtraction.priceMeta?.sequenceIndex ?? 0,
+      sequenceIndex: snippetExtraction.priceMeta?.sequenceIndex ?? 0,
+      fromLabel: snippetExtraction.priceMeta?.source === 'regex',
+      hasCurrency: !!snippetExtraction.priceMeta?.hasCurrency,
+      isPriceLabel: !!snippetExtraction.priceMeta?.hasPriceLabel,
+      isTarifa: !!snippetExtraction.priceMeta?.hasTarifaLabel
+    });
+    const snippetScoreGlobal = computeGlobalCandidateScore(snippetPriceCandidate).score;
+    const snippetScore = Math.max(snippetScoreLocal, snippetScoreGlobal);
+    const currentScore = computeGlobalCandidateScore(priceCandidate).score;
+    if (!priceCandidate || snippetScore > currentScore){
+      priceCandidate = snippetPriceCandidate;
+    }
+  } else if (!priceCandidate && snippetExtraction.price){
+    priceCandidate = snippetExtraction.price;
+  }
+
+  if (!kwhCandidate){
+    throw new Error('Valor de kWh não identificado no PDF.');
+  }
+  if (!priceCandidate){
+    throw new Error('Valor unitário não identificado no PDF.');
+  }
+
+  if (!isFinite(kwhCandidate.value)) throw new Error('Valor de kWh não identificado no PDF.');
+  if (!isFinite(priceCandidate.value)) throw new Error('Valor unitário não identificado no PDF.');
+
+  return { kwh: kwhCandidate.value, price: priceCandidate.value };
+}
+
+if (billTrigger && billInput){
+  billTrigger.addEventListener('click', ()=> billInput.click());
+}
+
+if (billInput){
+  billInput.addEventListener('change', async ()=>{
+    const file = billInput.files && billInput.files[0];
+    if (!file){
+      if (billFileName) billFileName.textContent = 'Nenhum arquivo selecionado';
+      setBillStatus(BILL_STATUS_DEFAULT);
+      return;
+    }
+    if (billFileName) billFileName.textContent = file.name;
+    setBillStatus('Lendo PDF, aguarde...');
+    try {
+      const { kwh, price } = await extractBillValues(file);
+      inj.value = formatLocaleNumber(kwh, 2);
+      unit.value = formatLocaleNumber(price, 6);
+      calculate();
+      setBillStatus('Valores preenchidos com sucesso!', 'ok');
+      billInput.value = '';
+    } catch (error) {
+      console.error('PDF parse error:', error);
+      setBillStatus(error.message || 'Não foi possível ler o PDF.', 'error');
+    }
+  });
+}
 
 const vBase = document.getElementById('vBase');
 const vPct = document.getElementById('vPct');
@@ -67,6 +827,10 @@ const sInj = document.getElementById('sInj');
 const sUnit = document.getElementById('sUnit');
 const sPct = document.getElementById('sPct');
 const sFinal = document.getElementById('sFinal');
+const sUtility = document.getElementById('sUtility');
+const sSavings = document.getElementById('sSavings');
+const utilityRow = document.getElementById('utilityRow');
+const savingsRow = document.getElementById('savingsRow');
 
 const calcBtn = document.getElementById('calcBtn');
 const clearBtn = document.getElementById('clearBtn');
@@ -102,6 +866,27 @@ const useAccountBtn = document.getElementById('useAccountBtn');
 const saveAccountBtn = document.getElementById('saveAccountBtn');
 const deleteAccountBtn = document.getElementById('deleteAccountBtn');
 const clearAccountBtn = document.getElementById('clearAccountBtn'); // NOVO: botão limpar campos
+
+const accountHelperText = accountSelect ? accountSelect.closest('.full')?.querySelector('small.muted') : null;
+const ACCOUNT_FEATURES_DISABLED_MESSAGE = 'Sincronizar contas requer conexão com o Supabase, indisponível no momento.';
+function disableAccountFeatures(message){
+  if (accountSelect){
+    accountSelect.innerHTML = '<option value="">Recurso indisponível</option>';
+    accountSelect.disabled = true;
+  }
+  [useAccountBtn, saveAccountBtn, deleteAccountBtn].forEach(btn => {
+    if (btn){
+      btn.disabled = true;
+      btn.title = message;
+    }
+  });
+  if (accountHelperText){
+    accountHelperText.textContent = message;
+  }
+}
+if (!sb){
+  disableAccountFeatures(ACCOUNT_FEATURES_DISABLED_MESSAGE);
+}
 
 /* ==========================
    Área do QR
@@ -170,12 +955,17 @@ function calculate(){
     resBox.hidden = true;
     if (inj.value || unit.value) err.classList.add('show');
     sInj.textContent = '—'; sUnit.textContent = '—'; sPct.textContent = '—'; sFinal.textContent = fmtBRL(0);
+    if (sUtility) sUtility.textContent = fmtBRL(0);
+    if (sSavings) sSavings.textContent = fmtBRL(0);
+    if (savingsRow) savingsRow.classList.remove('negative');
     return;
   }
 
   const base = nInj * nUnit;
   const desc = base * (pct/100);
   const final = base - desc;
+  const utilityCost = base + FIXED_ENERGY_FEE;
+  const savingsValue = utilityCost - final;
 
   vBase.textContent = fmtBRL(base);
   vPct.textContent = `${pct.toLocaleString('pt-BR')}%`;
@@ -186,6 +976,9 @@ function calculate(){
   sUnit.textContent = `${fmtBRL(nUnit)} / kWh`;
   sPct.textContent = `${pct.toLocaleString('pt-BR')}%`;
   sFinal.textContent = fmtBRL(final);
+  if (sUtility) sUtility.textContent = fmtBRL(utilityCost);
+  if (sSavings) sSavings.textContent = fmtBRL(savingsValue);
+  if (savingsRow) savingsRow.classList.toggle('negative', savingsValue < 0);
 
   resBox.hidden = false;
 
@@ -210,7 +1003,13 @@ clearBtn.addEventListener('click', ()=>{
   syncChips(); showAllDiscounts();
   err.classList.remove('show'); resBox.hidden=true;
   sInj.textContent='—'; sUnit.textContent='—'; sPct.textContent='—'; sFinal.textContent=fmtBRL(0);
+  if (sUtility) sUtility.textContent = fmtBRL(0);
+  if (sSavings) sSavings.textContent = fmtBRL(0);
+  if (savingsRow) savingsRow.classList.remove('negative');
   qrcodeBox.innerHTML=''; qrArea.classList.add('hidden'); qrPayload.value='';
+  if (billInput) billInput.value='';
+  if (billFileName) billFileName.textContent='Nenhum arquivo selecionado';
+  setBillStatus(BILL_STATUS_DEFAULT);
 });
 
 /* ==========================
@@ -394,6 +1193,7 @@ function setPixFormData(acc){
 
 /* ===== Supabase: CRUD de contas ===== */
 async function dbLoadAccounts(){
+  if (!sb) return [];
   try {
     await ensureAuth();
     const { data, error } = await sb.from('accounts')
@@ -409,6 +1209,10 @@ async function dbLoadAccounts(){
   }
 }
 async function dbSaveAccount(acc){ // {label,type,key,name?,city?}
+  if (!sb) {
+    alert(ACCOUNT_FEATURES_DISABLED_MESSAGE);
+    return;
+  }
   try {
     const user = await ensureAuth();
     const payload = { ...acc, user_id: user.id, created_at: new Date().toISOString() };
@@ -421,6 +1225,10 @@ async function dbSaveAccount(acc){ // {label,type,key,name?,city?}
   }
 }
 async function dbDeleteAccount(idOrLabel){
+  if (!sb) {
+    alert(ACCOUNT_FEATURES_DISABLED_MESSAGE);
+    return;
+  }
   try {
     await ensureAuth();
     let { error } = await sb.from('accounts').delete().eq('id', idOrLabel).eq('user_id', currentUser.id);
@@ -435,6 +1243,10 @@ async function dbDeleteAccount(idOrLabel){
   }
 }
 async function refreshAccountSelect(){
+  if (!sb) {
+    disableAccountFeatures(ACCOUNT_FEATURES_DISABLED_MESSAGE);
+    return;
+  }
   try {
     const list = await dbLoadAccounts();
     accountSelect.innerHTML = '<option value="">— selecionar conta —</option>';
@@ -468,6 +1280,10 @@ useAccountBtn.addEventListener('click', ()=>{
 });
 
 saveAccountBtn.addEventListener('click', async ()=>{
+  if (!sb) {
+    alert(ACCOUNT_FEATURES_DISABLED_MESSAGE);
+    return;
+  }
   const data = getPixFormData();
   if (!data.key){ alert('Informe a chave Pix para salvar.'); pixKey.focus(); return; }
   const label = prompt('Nome da conta (ex.: Conta 1, Leticia):', data.name || data.key);
@@ -479,6 +1295,10 @@ saveAccountBtn.addEventListener('click', async ()=>{
 });
 
 deleteAccountBtn.addEventListener('click', async ()=>{
+  if (!sb) {
+    alert(ACCOUNT_FEATURES_DISABLED_MESSAGE);
+    return;
+  }
   const sel = accountSelect.selectedOptions[0];
   if (!sel || !sel.value){ alert('Selecione uma conta para excluir.'); return; }
   const acc = JSON.parse(sel.dataset.payload);
