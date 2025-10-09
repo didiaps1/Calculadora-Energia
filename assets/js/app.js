@@ -92,6 +92,29 @@ function findNumberInText(text){
   return { raw, value };
 }
 
+function getDecimalCount(raw){
+  if (!raw) return 0;
+  const match = String(raw).match(/[.,](\d+)/);
+  return match ? match[1].length : 0;
+}
+
+function scorePriceCandidate(candidate, { distance = 0, fromLabel = false, hasCurrency = false, sequenceIndex = 0 } = {}){
+  if (!candidate || !isFinite(candidate.value)) return -Infinity;
+  const decimals = getDecimalCount(candidate.raw);
+  let score = 0;
+  if (fromLabel) score += 60;
+  if (hasCurrency) score += 15;
+  if (decimals >= 4) score += 30;
+  else if (decimals === 3) score += 18;
+  else if (decimals === 2) score += 6;
+  if (candidate.value > 0 && candidate.value < 5) score += 35;
+  else if (candidate.value >= 5 && candidate.value < 10) score += 12;
+  else if (candidate.value >= 10) score -= 12;
+  score -= distance * 1.5;
+  score -= sequenceIndex * 0.1;
+  return score;
+}
+
 async function flateDecode(bytes){
   if (typeof DecompressionStream === 'function'){
     for (const format of ['deflate', 'deflate-raw']){
@@ -371,47 +394,54 @@ async function extractBillValues(file){
   let priceCandidate = null;
   if (tokenData.length){
     const referenceIndex = kwhTokenIndex !== -1 ? kwhTokenIndex : (anchorTokenIndex !== -1 ? anchorTokenIndex : 0);
-    let fallbackPrice = null;
-    outerPrice:
-    for (let i = referenceIndex; i < tokenData.length && i <= referenceIndex + 60; i++){
+    const priceCandidates = [];
+    const maxIndex = Math.min(tokenData.length, referenceIndex + 80);
+
+    const pushCandidate = (number, index, opts = {}) => {
+      if (!number || !isFinite(number.value) || number.value <= 0) return;
+      if (kwhCandidate && number.value === kwhCandidate.value && Math.abs(index - kwhTokenIndex) <= 1) return;
+      const distance = Math.abs(index - referenceIndex);
+      priceCandidates.push({
+        number,
+        index,
+        distance,
+        fromLabel: !!opts.fromLabel,
+        hasCurrency: !!opts.hasCurrency
+      });
+    };
+
+    for (let i = referenceIndex; i < maxIndex; i++){
       const token = tokenData[i];
-      const number = findNumberInText(token.raw);
       const normalized = token.upperNormalized;
+      const number = findNumberInText(token.raw);
       const hasCurrency = token.raw.includes('R$') || normalized.includes('RS');
       const isPriceLabel = normalized.includes('PRECO') && normalized.includes('UNIT');
 
-      if (kwhCandidate && number && number.value === kwhCandidate.value && Math.abs(i - kwhTokenIndex) <= 1){
-        continue;
-      }
-
       if (isPriceLabel){
-        if (number && number.value > 0){
-          priceCandidate = number;
-          break;
-        }
-        for (let j = i + 1; j < tokenData.length && j <= i + 4; j++){
+        for (let j = i + 1; j < tokenData.length && j <= i + 6; j++){
           const lookahead = findNumberInText(tokenData[j].raw);
-          if (lookahead && lookahead.value > 0){
-            priceCandidate = lookahead;
-            break outerPrice;
-          }
+          const lookaheadCurrency = tokenData[j].raw.includes('R$') || tokenData[j].upperNormalized.includes('RS');
+          pushCandidate(lookahead, j, { fromLabel: true, hasCurrency: lookaheadCurrency });
         }
       }
 
-      if (!priceCandidate && hasCurrency && number && number.value > 0){
-        priceCandidate = number;
-        break;
-      }
-
-      if (!priceCandidate && number && number.value > 0 && number.value < 5){
-        const distance = Math.abs(i - referenceIndex);
-        if (!fallbackPrice || distance < fallbackPrice.distance){
-          fallbackPrice = { candidate: number, distance };
-        }
-      }
+      pushCandidate(number, i, { hasCurrency });
     }
-    if (!priceCandidate && fallbackPrice){
-      priceCandidate = fallbackPrice.candidate;
+
+    if (priceCandidates.length){
+      let best = null;
+      priceCandidates.forEach((candidate, seqIdx) => {
+        const score = scorePriceCandidate(candidate.number, {
+          distance: candidate.distance,
+          fromLabel: candidate.fromLabel,
+          hasCurrency: candidate.hasCurrency,
+          sequenceIndex: seqIdx
+        });
+        if (!best || score > best.score || (score === best.score && candidate.distance < best.distance)){
+          best = { ...candidate, score };
+        }
+      });
+      if (best) priceCandidate = best.number;
     }
   }
 
@@ -459,8 +489,16 @@ async function extractBillValues(file){
       const idx = numberMatches.findIndex(entry => entry.raw === kwh.raw || entry.value === kwh.value);
       if (idx !== -1){
         const after = numberMatches.slice(idx + 1);
-        price = after.find(entry => entry.value > 0 && entry.value < 5)
-          || after.find(entry => entry.value > 0) || null;
+        if (after.length){
+          let best = null;
+          after.forEach((entry, seqIdx) => {
+            const score = scorePriceCandidate(entry, { distance: seqIdx + 1, sequenceIndex: seqIdx });
+            if (!best || score > best.score){
+              best = { entry, score };
+            }
+          });
+          if (best) price = best.entry;
+        }
       }
     }
     if (!price){
@@ -471,8 +509,14 @@ async function extractBillValues(file){
       }
     }
     if (!price){
-      price = numberMatches.find(entry => entry.value > 0 && entry.value < 5)
-        || numberMatches.find(entry => entry.value > 0) || null;
+      let best = null;
+      numberMatches.forEach((entry, seqIdx) => {
+        const score = scorePriceCandidate(entry, { distance: seqIdx + 1, sequenceIndex: seqIdx });
+        if (!best || score > best.score){
+          best = { entry, score };
+        }
+      });
+      if (best) price = best.entry;
     }
 
     return { kwh, price };
