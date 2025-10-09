@@ -31,6 +31,16 @@
             </div>
           </div>
 
+          <div class="full">
+            <label class="lbl" for="billUpload">Importar conta (PDF)</label>
+            <div class="row uploadRow">
+              <button id="billTrigger" class="btn outline" type="button">Selecionar PDF</button>
+              <span id="billFileName" class="muted">Nenhum arquivo selecionado</span>
+            </div>
+            <input id="billUpload" type="file" accept="application/pdf" hidden>
+            <small id="billStatus" class="billStatus">Envie a conta em PDF para preencher automaticamente.</small>
+          </div>
+
           <div>
             <label class="lbl">Desconto a conceder</label>
             <div class="row" id="discountRow" aria-label="Opções de desconto">
@@ -91,9 +101,19 @@
         </div>
 
         <div class="result" style="margin-top:14px">
+          <div class="r emph danger" id="utilityRow">
+            <span class="k">Pagaria de energia</span>
+            <span class="v" id="sUtility">R$ 0,00</span>
+          </div>
+
           <div class="r total">
             <span class="k">Cliente deve pagar</span>
-            <span class="v" id="sFinal" style="font-size:22px">R$ 0,00</span>
+            <span class="v" id="sFinal">R$ 0,00</span>
+          </div>
+
+          <div class="r emph success" id="savingsRow">
+            <span class="k">Economia gerada</span>
+            <span class="v" id="sSavings">R$ 0,00</span>
           </div>
 
           <div class="actions" style="margin-top:10px">
@@ -193,7 +213,7 @@
   <!-- ===== ORDEM CORRETA DE SCRIPTS ===== -->
   <!-- 1) QRCode lib (usada no app.js) -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-  <!-- 2) Captura e PDF (usados no app.js) -->
+  <!-- 2) Captura (usado no app.js) -->
   <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
   <!-- 3) Supabase SDK (usado no app.js) -->
