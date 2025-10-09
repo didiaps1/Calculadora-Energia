@@ -3,16 +3,22 @@
    ========================== */
 const SUPABASE_URL = 'https://qlgzktpcwlpyeqfkcaut.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFsZ3prdHBjd2xweWVxZmtjYXV0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTk4NjYxMjIsImV4cCI6MjA3NTQ0MjEyMn0.Zuo9F2lo6rkhopeMAITWUBSNuobWti_ai0YDrhJWklE';
-const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const supabaseLib = typeof window !== 'undefined' ? window.supabase : undefined;
+const hasSupabaseSDK = !!(supabaseLib && typeof supabaseLib.createClient === 'function');
+const sb = hasSupabaseSDK ? supabaseLib.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
 
-// Listener de auth state
-sb.auth.onAuthStateChange((event, session) => {
-  console.log('Supabase auth state:', event, session?.user?.id || 'No user');
-});
+if (sb) {
+  sb.auth.onAuthStateChange((event, session) => {
+    console.log('Supabase auth state:', event, session?.user?.id || 'No user');
+  });
+} else {
+  console.warn('Supabase SDK não carregou; recursos de contas salvas foram desativados.');
+}
 
 // login anônimo (gera um user_id por navegador)
 let currentUser = null;
 async function ensureAuth() {
+  if (!sb) return null;
   try {
     const { data: { user } } = await sb.auth.getUser();
     if (user) { 
@@ -58,6 +64,484 @@ const unit = document.getElementById('unit');
 const err = document.getElementById('err');
 const resBox = document.getElementById('res');
 
+const billTrigger = document.getElementById('billTrigger');
+const billInput = document.getElementById('billUpload');
+const billFileName = document.getElementById('billFileName');
+const billStatus = document.getElementById('billStatus');
+const BILL_STATUS_DEFAULT = 'Envie a conta em PDF para preencher automaticamente.';
+
+function setBillStatus(text, state = 'muted'){
+  if (!billStatus) return;
+  billStatus.textContent = text;
+  billStatus.classList.remove('ok', 'error');
+  if (state === 'ok') billStatus.classList.add('ok');
+  if (state === 'error') billStatus.classList.add('error');
+}
+
+function formatLocaleNumber(n, digits){
+  return isFinite(n) ? n.toLocaleString('pt-BR',{minimumFractionDigits:digits,maximumFractionDigits:digits}) : '';
+}
+
+function findNumberInText(text){
+  if (!text) return null;
+  const match = String(text).match(/-?\d{1,3}(?:\.\d{3})*,\d+|-?\d+(?:\.\d+)?/);
+  if (!match) return null;
+  const raw = match[0];
+  const value = toNumber(raw);
+  if (!isFinite(value)) return null;
+  return { raw, value };
+}
+
+async function flateDecode(bytes){
+  if (typeof DecompressionStream === 'function'){
+    for (const format of ['deflate', 'deflate-raw']){
+      try {
+        const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream(format));
+        const buffer = await new Response(stream).arrayBuffer();
+        if (buffer.byteLength){
+          return new TextDecoder('utf-8').decode(buffer);
+        }
+      } catch (error) {
+        console.warn(`DecompressionStream ${format} falhou`, error);
+      }
+    }
+  }
+  throw new Error('Este navegador não suporta a leitura automática do PDF.');
+}
+
+function decodePdfLiteralString(source, startIndex){
+  const chars = [];
+  let i = startIndex;
+  while (i < source.length){
+    const ch = source[i];
+    if (ch === ')'){
+      return { value: chars.join(''), nextIndex: i + 1 };
+    }
+    if (ch === '\\'){
+      const next = source[i + 1];
+      if (next === undefined){
+        return { value: chars.join(''), nextIndex: source.length };
+      }
+      if (/^[0-7]$/.test(next)){
+        let oct = next;
+        let consumed = 1;
+        for (let j = 2; j <= 3 && /^[0-7]$/.test(source[i + j]); j++){
+          oct += source[i + j];
+          consumed++;
+        }
+        chars.push(String.fromCharCode(parseInt(oct, 8)));
+        i += consumed + 1;
+        continue;
+      }
+      const map = { n: '\n', r: '\r', t: '\t', b: '\b', f: '\f', '(': '(', ')': ')', '\\': '\\' };
+      chars.push(map[next] ?? next);
+      i += 2;
+      continue;
+    }
+    chars.push(ch);
+    i++;
+  }
+  return { value: chars.join(''), nextIndex: source.length };
+}
+
+function decodePdfHexString(source, startIndex){
+  let i = startIndex;
+  let hex = '';
+  while (i < source.length){
+    const ch = source[i];
+    if (ch === '>'){
+      break;
+    }
+    if (!/\s/.test(ch)){
+      hex += ch;
+    }
+    i++;
+  }
+  if (hex.length % 2 === 1){
+    hex += '0';
+  }
+  let value = '';
+  for (let j = 0; j < hex.length; j += 2){
+    const code = parseInt(hex.slice(j, j + 2), 16);
+    value += String.fromCharCode(code);
+  }
+  if (value.length >= 2 && value.charCodeAt(0) === 0xFE && value.charCodeAt(1) === 0xFF){
+    let decoded = '';
+    for (let k = 2; k < value.length; k += 2){
+      decoded += String.fromCharCode((value.charCodeAt(k) << 8) + (value.charCodeAt(k + 1) || 0));
+    }
+    value = decoded;
+  }
+  return { value, nextIndex: i + 1 };
+}
+
+function sanitizePdfString(raw){
+  let value = raw;
+  if (value.length >= 2 && value.charCodeAt(0) === 0xFE && value.charCodeAt(1) === 0xFF){
+    let decoded = '';
+    for (let i = 2; i < value.length; i += 2){
+      decoded += String.fromCharCode((value.charCodeAt(i) << 8) + (value.charCodeAt(i + 1) || 0));
+    }
+    value = decoded;
+  }
+  return value.replace(/[\r\n]+/g, ' ').trim();
+}
+
+function collectPdfStringsInto(content, target){
+  for (let i = 0; i < content.length; i++){
+    const ch = content[i];
+    if (ch === '('){
+      const { value, nextIndex } = decodePdfLiteralString(content, i + 1);
+      const sanitized = value ? sanitizePdfString(value) : '';
+      if (sanitized) target.push(sanitized);
+      i = nextIndex - 1;
+    } else if (ch === '<' && content[i + 1] !== '<'){
+      const { value, nextIndex } = decodePdfHexString(content, i + 1);
+      const sanitized = value ? sanitizePdfString(value) : '';
+      if (sanitized) target.push(sanitized);
+      i = nextIndex - 1;
+    }
+  }
+  return target;
+}
+
+async function extractPdfText(buffer){
+  const bytes = new Uint8Array(buffer);
+  const latin1Decoder = new TextDecoder('latin1');
+  const asciiSnapshot = latin1Decoder.decode(bytes);
+  const segments = [];
+  const stringTokens = [];
+  let hadCompressedStream = false;
+  let decodeFailed = false;
+  let decodeErrorMessage = '';
+  const streamRegex = /<<[\s\S]*?>>\s*stream\r?\n/g;
+  let match;
+  while ((match = streamRegex.exec(asciiSnapshot)) !== null){
+    const dict = match[0];
+    const hasFlate = /\/Filter\s*(?:\[[^\]]*\/FlateDecode[^\]]*\]|\/FlateDecode)/.test(dict);
+    const start = streamRegex.lastIndex;
+    const end = asciiSnapshot.indexOf('endstream', start);
+    if (end === -1) break;
+    let startIndex = start;
+    if (bytes[startIndex] === 0x0d && bytes[startIndex + 1] === 0x0a) startIndex += 2;
+    else if (bytes[startIndex] === 0x0a || bytes[startIndex] === 0x0d) startIndex += 1;
+    let endIndex = end;
+    while (endIndex > startIndex && (bytes[endIndex - 1] === 0x0d || bytes[endIndex - 1] === 0x0a)) endIndex--;
+    const chunk = bytes.slice(startIndex, endIndex);
+    if (!chunk.length) continue;
+    let textChunk = '';
+    try {
+      if (hasFlate){
+        hadCompressedStream = true;
+        textChunk = await flateDecode(chunk);
+      } else {
+        textChunk = latin1Decoder.decode(chunk);
+      }
+    } catch (error) {
+      decodeFailed = true;
+      if (!decodeErrorMessage && error && error.message) decodeErrorMessage = String(error.message);
+      console.warn('Falha ao decodificar parte do PDF', error);
+      continue;
+    }
+    if (textChunk){
+      const cleaned = textChunk.replace(/\0/g, ' ');
+      segments.push(cleaned);
+      collectPdfStringsInto(cleaned, stringTokens);
+    }
+  }
+  if (!segments.length){
+    const fallback = asciiSnapshot.replace(/\0/g, ' ');
+    segments.push(fallback);
+    collectPdfStringsInto(fallback, stringTokens);
+  }
+  const joinedText = segments.join(' ');
+  const joinedSnippets = stringTokens.join(' ');
+  return {
+    text: joinedText,
+    extractedStrings: joinedSnippets,
+    tokens: stringTokens,
+    hadCompressedStream,
+    decodeFailed,
+    decodeErrorMessage
+  };
+}
+
+function normalizeAccents(str){
+  if (!str) return '';
+  return str.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
+async function extractBillValues(file){
+  const buffer = await file.arrayBuffer();
+  const { text, extractedStrings, tokens, hadCompressedStream, decodeFailed, decodeErrorMessage } = await extractPdfText(buffer);
+  const sourceText = extractedStrings && extractedStrings.length > 40 ? extractedStrings : text;
+  const rawText = sourceText.replace(/\s+/g, ' ').trim();
+  if (!rawText && hadCompressedStream && decodeFailed){
+    const fallbackMsg = decodeErrorMessage || 'Não foi possível extrair o texto comprimido do PDF neste navegador. Use um navegador atualizado (Chrome ou Edge) ou informe os valores manualmente.';
+    throw new Error(fallbackMsg);
+  }
+  if (!rawText){
+    throw new Error('Não foi possível ler o conteúdo do PDF.');
+  }
+
+  const anchors = [
+    { term: 'INJEÇÃO SCEE', normalized: 'INJECAO SCEE' },
+    { term: 'CRÉDITO RECEBIDO', normalized: 'CREDITO RECEBIDO' },
+    { term: 'CREDITO RECEBIDO', normalized: 'CREDITO RECEBIDO' },
+    { term: '(CRÉDITO RECEBIDO)', normalized: '(CREDITO RECEBIDO)' },
+    { term: '(CREDITO RECEBIDO)', normalized: '(CREDITO RECEBIDO)' }
+  ];
+
+  const tokenData = (tokens || []).map((raw, index) => {
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    const normalized = normalizeAccents(trimmed);
+    return {
+      raw: trimmed,
+      upper: trimmed.toUpperCase(),
+      normalized,
+      upperNormalized: normalized.toUpperCase(),
+      index
+    };
+  }).filter(Boolean);
+
+  let anchorTokenIndex = -1;
+  outerAnchor:
+  for (const anchor of anchors){
+    const idx = tokenData.findIndex(token =>
+      token.upper.includes(anchor.term) || token.upperNormalized.includes(anchor.normalized)
+    );
+    if (idx !== -1){
+      anchorTokenIndex = idx;
+      break outerAnchor;
+    }
+  }
+  if (anchorTokenIndex === -1){
+    outerCombined:
+    for (const anchor of anchors){
+      for (let i = 0; i < tokenData.length - 1; i++){
+        const combined = `${tokenData[i].upperNormalized} ${tokenData[i + 1].upperNormalized}`;
+        if (combined.includes(anchor.normalized)){
+          anchorTokenIndex = i;
+          break outerCombined;
+        }
+      }
+    }
+  }
+
+  const snippetFromTokens = anchorTokenIndex !== -1 && tokenData.length
+    ? tokenData.slice(Math.max(0, anchorTokenIndex - 6), Math.min(tokenData.length, anchorTokenIndex + 30)).map(t => t.raw).join(' ')
+    : '';
+
+  let kwhCandidate = null;
+  let kwhTokenIndex = -1;
+  if (tokenData.length){
+    const kwhCandidates = [];
+    tokenData.forEach((token, idx) => {
+      if (!token.upperNormalized.includes('KWH')) return;
+      let candidate = findNumberInText(token.raw);
+      let candidateIndex = idx;
+      if (!candidate || candidate.value < 1){
+        for (let j = idx + 1; j < tokenData.length && j <= idx + 4; j++){
+          const lookahead = findNumberInText(tokenData[j].raw);
+          if (lookahead && lookahead.value >= 1){
+            candidate = lookahead;
+            candidateIndex = j;
+            break;
+          }
+        }
+      }
+      if (candidate && candidate.value >= 1){
+        const distance = anchorTokenIndex !== -1 ? Math.abs(candidateIndex - anchorTokenIndex) : 0;
+        kwhCandidates.push({ candidate, index: candidateIndex, distance });
+      }
+    });
+    if (kwhCandidates.length){
+      kwhCandidates.sort((a, b) => {
+        if (anchorTokenIndex !== -1 && a.distance !== b.distance){
+          return a.distance - b.distance;
+        }
+        return a.index - b.index;
+      });
+      kwhCandidate = kwhCandidates[0].candidate;
+      kwhTokenIndex = kwhCandidates[0].index;
+    }
+  }
+
+  let priceCandidate = null;
+  if (tokenData.length){
+    const referenceIndex = kwhTokenIndex !== -1 ? kwhTokenIndex : (anchorTokenIndex !== -1 ? anchorTokenIndex : 0);
+    let fallbackPrice = null;
+    outerPrice:
+    for (let i = referenceIndex; i < tokenData.length && i <= referenceIndex + 60; i++){
+      const token = tokenData[i];
+      const number = findNumberInText(token.raw);
+      const normalized = token.upperNormalized;
+      const hasCurrency = token.raw.includes('R$') || normalized.includes('RS');
+      const isPriceLabel = normalized.includes('PRECO') && normalized.includes('UNIT');
+
+      if (kwhCandidate && number && number.value === kwhCandidate.value && Math.abs(i - kwhTokenIndex) <= 1){
+        continue;
+      }
+
+      if (isPriceLabel){
+        if (number && number.value > 0){
+          priceCandidate = number;
+          break;
+        }
+        for (let j = i + 1; j < tokenData.length && j <= i + 4; j++){
+          const lookahead = findNumberInText(tokenData[j].raw);
+          if (lookahead && lookahead.value > 0){
+            priceCandidate = lookahead;
+            break outerPrice;
+          }
+        }
+      }
+
+      if (!priceCandidate && hasCurrency && number && number.value > 0){
+        priceCandidate = number;
+        break;
+      }
+
+      if (!priceCandidate && number && number.value > 0 && number.value < 5){
+        const distance = Math.abs(i - referenceIndex);
+        if (!fallbackPrice || distance < fallbackPrice.distance){
+          fallbackPrice = { candidate: number, distance };
+        }
+      }
+    }
+    if (!priceCandidate && fallbackPrice){
+      priceCandidate = fallbackPrice.candidate;
+    }
+  }
+
+  const normalized = normalizeAccents(rawText);
+  const upper = rawText.toUpperCase();
+  const upperNormalized = normalized.toUpperCase();
+
+  function buildSnippetFromText(){
+    for (const anchor of anchors){
+      let idx = upper.indexOf(anchor.term);
+      let base = rawText;
+      if (idx === -1){
+        idx = upperNormalized.indexOf(anchor.normalized);
+        base = normalized;
+      }
+      if (idx !== -1){
+        return base.slice(Math.max(0, idx - 80), idx + 260);
+      }
+    }
+    return '';
+  }
+
+  function extractFromSnippet(snippetText){
+    if (!snippetText) return { kwh: null, price: null };
+    const numberPattern = /(\d{1,3}(?:\.\d{3})*,\d+|\d+(?:\.\d+)?)/g;
+    const numberMatches = [...snippetText.matchAll(numberPattern)].map(match => ({
+      raw: match[1] || match[0],
+      value: toNumber(match[1] || match[0]),
+      index: match.index ?? snippetText.indexOf(match[0])
+    })).filter(entry => isFinite(entry.value));
+
+    const kwhFromTag = (() => {
+      const match = snippetText.match(/KWH[^\d]*([\d.,]+)/i);
+      if (!match) return null;
+      return { raw: match[1], value: toNumber(match[1]) };
+    })();
+
+    let kwh = kwhFromTag;
+    if (!kwh){
+      kwh = numberMatches.find(entry => entry.value >= 1) || null;
+    }
+
+    let price = null;
+    if (kwh){
+      const idx = numberMatches.findIndex(entry => entry.raw === kwh.raw || entry.value === kwh.value);
+      if (idx !== -1){
+        const after = numberMatches.slice(idx + 1);
+        price = after.find(entry => entry.value > 0 && entry.value < 5)
+          || after.find(entry => entry.value > 0) || null;
+      }
+    }
+    if (!price){
+      const match = snippetText.match(/(?:PRE[CÇ]O\s*UNIT[^\d]*|R\$[^\d]*)\s*([\d.,]+)/i);
+      if (match){
+        const value = toNumber(match[1]);
+        if (isFinite(value)) price = { raw: match[1], value };
+      }
+    }
+    if (!price){
+      price = numberMatches.find(entry => entry.value > 0 && entry.value < 5)
+        || numberMatches.find(entry => entry.value > 0) || null;
+    }
+
+    return { kwh, price };
+  }
+
+  let snippet = snippetFromTokens;
+  if ((!kwhCandidate || !priceCandidate) && !snippet){
+    snippet = buildSnippetFromText();
+  }
+  if ((!kwhCandidate || !priceCandidate) && !snippet){
+    const fallbackMatch = rawText.match(/KWH[^\d]*[\d.,]+/i);
+    if (fallbackMatch){
+      const idx = fallbackMatch.index ?? rawText.indexOf(fallbackMatch[0]);
+      const start = Math.max(0, idx - 120);
+      snippet = rawText.slice(start, start + 320);
+    }
+  }
+
+  if ((!kwhCandidate || !priceCandidate) && !snippet){
+    throw new Error('Não foi possível localizar os campos de crédito no PDF. Informe os valores manualmente ou envie o arquivo completo.');
+  }
+
+  if (!kwhCandidate || !priceCandidate){
+    const { kwh: snippetKwh, price: snippetPrice } = extractFromSnippet(snippet);
+    if (!kwhCandidate && snippetKwh) kwhCandidate = snippetKwh;
+    if (!priceCandidate && snippetPrice) priceCandidate = snippetPrice;
+  }
+
+  if (!kwhCandidate){
+    throw new Error('Valor de kWh não identificado no PDF.');
+  }
+  if (!priceCandidate){
+    throw new Error('Valor unitário não identificado no PDF.');
+  }
+
+  if (!isFinite(kwhCandidate.value)) throw new Error('Valor de kWh não identificado no PDF.');
+  if (!isFinite(priceCandidate.value)) throw new Error('Valor unitário não identificado no PDF.');
+
+  return { kwh: kwhCandidate.value, price: priceCandidate.value };
+}
+
+if (billTrigger && billInput){
+  billTrigger.addEventListener('click', ()=> billInput.click());
+}
+
+if (billInput){
+  billInput.addEventListener('change', async ()=>{
+    const file = billInput.files && billInput.files[0];
+    if (!file){
+      if (billFileName) billFileName.textContent = 'Nenhum arquivo selecionado';
+      setBillStatus(BILL_STATUS_DEFAULT);
+      return;
+    }
+    if (billFileName) billFileName.textContent = file.name;
+    setBillStatus('Lendo PDF, aguarde...');
+    try {
+      const { kwh, price } = await extractBillValues(file);
+      inj.value = formatLocaleNumber(kwh, 2);
+      unit.value = formatLocaleNumber(price, 6);
+      calculate();
+      setBillStatus('Valores preenchidos com sucesso!', 'ok');
+      billInput.value = '';
+    } catch (error) {
+      console.error('PDF parse error:', error);
+      setBillStatus(error.message || 'Não foi possível ler o PDF.', 'error');
+    }
+  });
+}
+
 const vBase = document.getElementById('vBase');
 const vPct = document.getElementById('vPct');
 const vDesc = document.getElementById('vDesc');
@@ -102,6 +586,27 @@ const useAccountBtn = document.getElementById('useAccountBtn');
 const saveAccountBtn = document.getElementById('saveAccountBtn');
 const deleteAccountBtn = document.getElementById('deleteAccountBtn');
 const clearAccountBtn = document.getElementById('clearAccountBtn'); // NOVO: botão limpar campos
+
+const accountHelperText = accountSelect ? accountSelect.closest('.full')?.querySelector('small.muted') : null;
+const ACCOUNT_FEATURES_DISABLED_MESSAGE = 'Sincronizar contas requer conexão com o Supabase, indisponível no momento.';
+function disableAccountFeatures(message){
+  if (accountSelect){
+    accountSelect.innerHTML = '<option value="">Recurso indisponível</option>';
+    accountSelect.disabled = true;
+  }
+  [useAccountBtn, saveAccountBtn, deleteAccountBtn].forEach(btn => {
+    if (btn){
+      btn.disabled = true;
+      btn.title = message;
+    }
+  });
+  if (accountHelperText){
+    accountHelperText.textContent = message;
+  }
+}
+if (!sb){
+  disableAccountFeatures(ACCOUNT_FEATURES_DISABLED_MESSAGE);
+}
 
 /* ==========================
    Área do QR
@@ -211,6 +716,9 @@ clearBtn.addEventListener('click', ()=>{
   err.classList.remove('show'); resBox.hidden=true;
   sInj.textContent='—'; sUnit.textContent='—'; sPct.textContent='—'; sFinal.textContent=fmtBRL(0);
   qrcodeBox.innerHTML=''; qrArea.classList.add('hidden'); qrPayload.value='';
+  if (billInput) billInput.value='';
+  if (billFileName) billFileName.textContent='Nenhum arquivo selecionado';
+  setBillStatus(BILL_STATUS_DEFAULT);
 });
 
 /* ==========================
@@ -394,6 +902,7 @@ function setPixFormData(acc){
 
 /* ===== Supabase: CRUD de contas ===== */
 async function dbLoadAccounts(){
+  if (!sb) return [];
   try {
     await ensureAuth();
     const { data, error } = await sb.from('accounts')
@@ -409,6 +918,10 @@ async function dbLoadAccounts(){
   }
 }
 async function dbSaveAccount(acc){ // {label,type,key,name?,city?}
+  if (!sb) {
+    alert(ACCOUNT_FEATURES_DISABLED_MESSAGE);
+    return;
+  }
   try {
     const user = await ensureAuth();
     const payload = { ...acc, user_id: user.id, created_at: new Date().toISOString() };
@@ -421,6 +934,10 @@ async function dbSaveAccount(acc){ // {label,type,key,name?,city?}
   }
 }
 async function dbDeleteAccount(idOrLabel){
+  if (!sb) {
+    alert(ACCOUNT_FEATURES_DISABLED_MESSAGE);
+    return;
+  }
   try {
     await ensureAuth();
     let { error } = await sb.from('accounts').delete().eq('id', idOrLabel).eq('user_id', currentUser.id);
@@ -435,6 +952,10 @@ async function dbDeleteAccount(idOrLabel){
   }
 }
 async function refreshAccountSelect(){
+  if (!sb) {
+    disableAccountFeatures(ACCOUNT_FEATURES_DISABLED_MESSAGE);
+    return;
+  }
   try {
     const list = await dbLoadAccounts();
     accountSelect.innerHTML = '<option value="">— selecionar conta —</option>';
@@ -468,6 +989,10 @@ useAccountBtn.addEventListener('click', ()=>{
 });
 
 saveAccountBtn.addEventListener('click', async ()=>{
+  if (!sb) {
+    alert(ACCOUNT_FEATURES_DISABLED_MESSAGE);
+    return;
+  }
   const data = getPixFormData();
   if (!data.key){ alert('Informe a chave Pix para salvar.'); pixKey.focus(); return; }
   const label = prompt('Nome da conta (ex.: Conta 1, Leticia):', data.name || data.key);
@@ -479,6 +1004,10 @@ saveAccountBtn.addEventListener('click', async ()=>{
 });
 
 deleteAccountBtn.addEventListener('click', async ()=>{
+  if (!sb) {
+    alert(ACCOUNT_FEATURES_DISABLED_MESSAGE);
+    return;
+  }
   const sel = accountSelect.selectedOptions[0];
   if (!sel || !sel.value){ alert('Selecione uma conta para excluir.'); return; }
   const acc = JSON.parse(sel.dataset.payload);
