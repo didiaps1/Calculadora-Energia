@@ -82,6 +82,16 @@ function formatLocaleNumber(n, digits){
   return isFinite(n) ? n.toLocaleString('pt-BR',{minimumFractionDigits:digits,maximumFractionDigits:digits}) : '';
 }
 
+function findNumberInText(text){
+  if (!text) return null;
+  const match = String(text).match(/-?\d{1,3}(?:\.\d{3})*,\d+|-?\d+(?:\.\d+)?/);
+  if (!match) return null;
+  const raw = match[0];
+  const value = toNumber(raw);
+  if (!isFinite(value)) return null;
+  return { raw, value };
+}
+
 async function flateDecode(bytes){
   if (typeof DecompressionStream === 'function'){
     for (const format of ['deflate', 'deflate-raw']){
@@ -177,21 +187,22 @@ function sanitizePdfString(raw){
   return value.replace(/[\r\n]+/g, ' ').trim();
 }
 
-function collectPdfStrings(content){
-  const strings = [];
+function collectPdfStringsInto(content, target){
   for (let i = 0; i < content.length; i++){
     const ch = content[i];
     if (ch === '('){
       const { value, nextIndex } = decodePdfLiteralString(content, i + 1);
-      if (value) strings.push(sanitizePdfString(value));
+      const sanitized = value ? sanitizePdfString(value) : '';
+      if (sanitized) target.push(sanitized);
       i = nextIndex - 1;
     } else if (ch === '<' && content[i + 1] !== '<'){
       const { value, nextIndex } = decodePdfHexString(content, i + 1);
-      if (value) strings.push(sanitizePdfString(value));
+      const sanitized = value ? sanitizePdfString(value) : '';
+      if (sanitized) target.push(sanitized);
       i = nextIndex - 1;
     }
   }
-  return strings;
+  return target;
 }
 
 async function extractPdfText(buffer){
@@ -199,7 +210,7 @@ async function extractPdfText(buffer){
   const latin1Decoder = new TextDecoder('latin1');
   const asciiSnapshot = latin1Decoder.decode(bytes);
   const segments = [];
-  const textSnippets = [];
+  const stringTokens = [];
   let hadCompressedStream = false;
   let decodeFailed = false;
   let decodeErrorMessage = '';
@@ -235,23 +246,20 @@ async function extractPdfText(buffer){
     if (textChunk){
       const cleaned = textChunk.replace(/\0/g, ' ');
       segments.push(cleaned);
-      collectPdfStrings(cleaned).forEach(str => {
-        if (str) textSnippets.push(str);
-      });
+      collectPdfStringsInto(cleaned, stringTokens);
     }
   }
   if (!segments.length){
     const fallback = asciiSnapshot.replace(/\0/g, ' ');
     segments.push(fallback);
-    collectPdfStrings(fallback).forEach(str => {
-      if (str) textSnippets.push(str);
-    });
+    collectPdfStringsInto(fallback, stringTokens);
   }
   const joinedText = segments.join(' ');
-  const joinedSnippets = textSnippets.join(' ');
+  const joinedSnippets = stringTokens.join(' ');
   return {
     text: joinedText,
     extractedStrings: joinedSnippets,
+    tokens: stringTokens,
     hadCompressedStream,
     decodeFailed,
     decodeErrorMessage
@@ -265,7 +273,7 @@ function normalizeAccents(str){
 
 async function extractBillValues(file){
   const buffer = await file.arrayBuffer();
-  const { text, extractedStrings, hadCompressedStream, decodeFailed, decodeErrorMessage } = await extractPdfText(buffer);
+  const { text, extractedStrings, tokens, hadCompressedStream, decodeFailed, decodeErrorMessage } = await extractPdfText(buffer);
   const sourceText = extractedStrings && extractedStrings.length > 40 ? extractedStrings : text;
   const rawText = sourceText.replace(/\s+/g, ' ').trim();
   if (!rawText && hadCompressedStream && decodeFailed){
@@ -275,9 +283,7 @@ async function extractBillValues(file){
   if (!rawText){
     throw new Error('Não foi possível ler o conteúdo do PDF.');
   }
-  const upper = rawText.toUpperCase();
-  const normalized = normalizeAccents(rawText);
-  const upperNormalized = normalized.toUpperCase();
+
   const anchors = [
     { term: 'INJEÇÃO SCEE', normalized: 'INJECAO SCEE' },
     { term: 'CRÉDITO RECEBIDO', normalized: 'CREDITO RECEBIDO' },
@@ -286,21 +292,197 @@ async function extractBillValues(file){
     { term: '(CREDITO RECEBIDO)', normalized: '(CREDITO RECEBIDO)' }
   ];
 
-  let snippet = '';
+  const tokenData = (tokens || []).map((raw, index) => {
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    const normalized = normalizeAccents(trimmed);
+    return {
+      raw: trimmed,
+      upper: trimmed.toUpperCase(),
+      normalized,
+      upperNormalized: normalized.toUpperCase(),
+      index
+    };
+  }).filter(Boolean);
+
+  let anchorTokenIndex = -1;
+  outerAnchor:
   for (const anchor of anchors){
-    let idx = upper.indexOf(anchor.term);
-    let baseText = rawText;
-    if (idx === -1){
-      idx = upperNormalized.indexOf(anchor.normalized);
-      baseText = normalized;
-    }
+    const idx = tokenData.findIndex(token =>
+      token.upper.includes(anchor.term) || token.upperNormalized.includes(anchor.normalized)
+    );
     if (idx !== -1){
-      snippet = baseText.slice(Math.max(0, idx - 80), idx + 260);
-      break;
+      anchorTokenIndex = idx;
+      break outerAnchor;
+    }
+  }
+  if (anchorTokenIndex === -1){
+    outerCombined:
+    for (const anchor of anchors){
+      for (let i = 0; i < tokenData.length - 1; i++){
+        const combined = `${tokenData[i].upperNormalized} ${tokenData[i + 1].upperNormalized}`;
+        if (combined.includes(anchor.normalized)){
+          anchorTokenIndex = i;
+          break outerCombined;
+        }
+      }
     }
   }
 
-  if (!snippet){
+  const snippetFromTokens = anchorTokenIndex !== -1 && tokenData.length
+    ? tokenData.slice(Math.max(0, anchorTokenIndex - 6), Math.min(tokenData.length, anchorTokenIndex + 30)).map(t => t.raw).join(' ')
+    : '';
+
+  let kwhCandidate = null;
+  let kwhTokenIndex = -1;
+  if (tokenData.length){
+    const kwhCandidates = [];
+    tokenData.forEach((token, idx) => {
+      if (!token.upperNormalized.includes('KWH')) return;
+      let candidate = findNumberInText(token.raw);
+      let candidateIndex = idx;
+      if (!candidate || candidate.value < 1){
+        for (let j = idx + 1; j < tokenData.length && j <= idx + 4; j++){
+          const lookahead = findNumberInText(tokenData[j].raw);
+          if (lookahead && lookahead.value >= 1){
+            candidate = lookahead;
+            candidateIndex = j;
+            break;
+          }
+        }
+      }
+      if (candidate && candidate.value >= 1){
+        const distance = anchorTokenIndex !== -1 ? Math.abs(candidateIndex - anchorTokenIndex) : 0;
+        kwhCandidates.push({ candidate, index: candidateIndex, distance });
+      }
+    });
+    if (kwhCandidates.length){
+      kwhCandidates.sort((a, b) => {
+        if (anchorTokenIndex !== -1 && a.distance !== b.distance){
+          return a.distance - b.distance;
+        }
+        return a.index - b.index;
+      });
+      kwhCandidate = kwhCandidates[0].candidate;
+      kwhTokenIndex = kwhCandidates[0].index;
+    }
+  }
+
+  let priceCandidate = null;
+  if (tokenData.length){
+    const referenceIndex = kwhTokenIndex !== -1 ? kwhTokenIndex : (anchorTokenIndex !== -1 ? anchorTokenIndex : 0);
+    let fallbackPrice = null;
+    outerPrice:
+    for (let i = referenceIndex; i < tokenData.length && i <= referenceIndex + 60; i++){
+      const token = tokenData[i];
+      const number = findNumberInText(token.raw);
+      const normalized = token.upperNormalized;
+      const hasCurrency = token.raw.includes('R$') || normalized.includes('RS');
+      const isPriceLabel = normalized.includes('PRECO') && normalized.includes('UNIT');
+
+      if (kwhCandidate && number && number.value === kwhCandidate.value && Math.abs(i - kwhTokenIndex) <= 1){
+        continue;
+      }
+
+      if (isPriceLabel){
+        if (number && number.value > 0){
+          priceCandidate = number;
+          break;
+        }
+        for (let j = i + 1; j < tokenData.length && j <= i + 4; j++){
+          const lookahead = findNumberInText(tokenData[j].raw);
+          if (lookahead && lookahead.value > 0){
+            priceCandidate = lookahead;
+            break outerPrice;
+          }
+        }
+      }
+
+      if (!priceCandidate && hasCurrency && number && number.value > 0){
+        priceCandidate = number;
+        break;
+      }
+
+      if (!priceCandidate && number && number.value > 0 && number.value < 5){
+        const distance = Math.abs(i - referenceIndex);
+        if (!fallbackPrice || distance < fallbackPrice.distance){
+          fallbackPrice = { candidate: number, distance };
+        }
+      }
+    }
+    if (!priceCandidate && fallbackPrice){
+      priceCandidate = fallbackPrice.candidate;
+    }
+  }
+
+  const normalized = normalizeAccents(rawText);
+  const upper = rawText.toUpperCase();
+  const upperNormalized = normalized.toUpperCase();
+
+  function buildSnippetFromText(){
+    for (const anchor of anchors){
+      let idx = upper.indexOf(anchor.term);
+      let base = rawText;
+      if (idx === -1){
+        idx = upperNormalized.indexOf(anchor.normalized);
+        base = normalized;
+      }
+      if (idx !== -1){
+        return base.slice(Math.max(0, idx - 80), idx + 260);
+      }
+    }
+    return '';
+  }
+
+  function extractFromSnippet(snippetText){
+    if (!snippetText) return { kwh: null, price: null };
+    const numberPattern = /(\d{1,3}(?:\.\d{3})*,\d+|\d+(?:\.\d+)?)/g;
+    const numberMatches = [...snippetText.matchAll(numberPattern)].map(match => ({
+      raw: match[1] || match[0],
+      value: toNumber(match[1] || match[0]),
+      index: match.index ?? snippetText.indexOf(match[0])
+    })).filter(entry => isFinite(entry.value));
+
+    const kwhFromTag = (() => {
+      const match = snippetText.match(/KWH[^\d]*([\d.,]+)/i);
+      if (!match) return null;
+      return { raw: match[1], value: toNumber(match[1]) };
+    })();
+
+    let kwh = kwhFromTag;
+    if (!kwh){
+      kwh = numberMatches.find(entry => entry.value >= 1) || null;
+    }
+
+    let price = null;
+    if (kwh){
+      const idx = numberMatches.findIndex(entry => entry.raw === kwh.raw || entry.value === kwh.value);
+      if (idx !== -1){
+        const after = numberMatches.slice(idx + 1);
+        price = after.find(entry => entry.value > 0 && entry.value < 5)
+          || after.find(entry => entry.value > 0) || null;
+      }
+    }
+    if (!price){
+      const match = snippetText.match(/(?:PRE[CÇ]O\s*UNIT[^\d]*|R\$[^\d]*)\s*([\d.,]+)/i);
+      if (match){
+        const value = toNumber(match[1]);
+        if (isFinite(value)) price = { raw: match[1], value };
+      }
+    }
+    if (!price){
+      price = numberMatches.find(entry => entry.value > 0 && entry.value < 5)
+        || numberMatches.find(entry => entry.value > 0) || null;
+    }
+
+    return { kwh, price };
+  }
+
+  let snippet = snippetFromTokens;
+  if ((!kwhCandidate || !priceCandidate) && !snippet){
+    snippet = buildSnippetFromText();
+  }
+  if ((!kwhCandidate || !priceCandidate) && !snippet){
     const fallbackMatch = rawText.match(/KWH[^\d]*[\d.,]+/i);
     if (fallbackMatch){
       const idx = fallbackMatch.index ?? rawText.indexOf(fallbackMatch[0]);
@@ -309,48 +491,14 @@ async function extractBillValues(file){
     }
   }
 
-  if (!snippet){
+  if ((!kwhCandidate || !priceCandidate) && !snippet){
     throw new Error('Não foi possível localizar os campos de crédito no PDF. Informe os valores manualmente ou envie o arquivo completo.');
   }
 
-  const numberPattern = /(\d{1,3}(?:\.\d{3})*,\d+|\d+(?:\.\d+)?)/g;
-  const numberMatches = [...snippet.matchAll(numberPattern)].map(match => ({
-    raw: match[1] || match[0],
-    value: toNumber(match[1] || match[0]),
-    index: match.index ?? snippet.indexOf(match[0])
-  })).filter(entry => isFinite(entry.value));
-
-  const kwhFromTag = (()=>{
-    const match = snippet.match(/KWH[^\d]*([\d.,]+)/i);
-    if (!match) return null;
-    return { raw: match[1], value: toNumber(match[1]) };
-  })();
-
-  let kwhCandidate = kwhFromTag;
-  if (!kwhCandidate){
-    kwhCandidate = numberMatches.find(entry => entry.value >= 1);
-  }
-
-  const kwhIndexInList = kwhCandidate
-    ? numberMatches.findIndex(entry => entry.raw === kwhCandidate.raw || entry.value === kwhCandidate.value)
-    : -1;
-
-  const priceFromLabel = (()=>{
-    const match = snippet.match(/(?:PRE[CÇ]O\s*UNIT[^\d]*|R\$[^\d]*)\s*([\d.,]+)/i);
-    if (!match) return null;
-    return { raw: match[1], value: toNumber(match[1]) };
-  })();
-
-  let priceCandidate = priceFromLabel;
-  if (!priceCandidate && kwhIndexInList !== -1){
-    const after = numberMatches.slice(kwhIndexInList + 1);
-    priceCandidate = after.find(entry => entry.value > 0 && entry.value < 5)
-      || after.find(entry => entry.value > 0);
-  }
-
-  if (!priceCandidate){
-    priceCandidate = numberMatches.find(entry => entry.value > 0 && entry.value < 5)
-      || numberMatches.find(entry => entry.value > 0);
+  if (!kwhCandidate || !priceCandidate){
+    const { kwh: snippetKwh, price: snippetPrice } = extractFromSnippet(snippet);
+    if (!kwhCandidate && snippetKwh) kwhCandidate = snippetKwh;
+    if (!priceCandidate && snippetPrice) priceCandidate = snippetPrice;
   }
 
   if (!kwhCandidate){
@@ -360,11 +508,10 @@ async function extractBillValues(file){
     throw new Error('Valor unitário não identificado no PDF.');
   }
 
-  const kwhNum = toNumber(kwhCandidate.raw);
-  const priceNum = toNumber(priceCandidate.raw);
-  if (!isFinite(kwhNum)) throw new Error('Valor de kWh não identificado no PDF.');
-  if (!isFinite(priceNum)) throw new Error('Valor unitário não identificado no PDF.');
-  return { kwh: kwhNum, price: priceNum };
+  if (!isFinite(kwhCandidate.value)) throw new Error('Valor de kWh não identificado no PDF.');
+  if (!isFinite(priceCandidate.value)) throw new Error('Valor unitário não identificado no PDF.');
+
+  return { kwh: kwhCandidate.value, price: priceCandidate.value };
 }
 
 if (billTrigger && billInput){
