@@ -56,7 +56,17 @@ label.lbl{display:block;font-size:13px;color:var(--muted);margin-bottom:8px}
 .r{display:flex;justify-content:space-between;align-items:center;gap:10px}
 .r .k{color:var(--muted);font-size:14px}
 .r .v{font-variant-numeric:tabular-nums;font-weight:700}
+.r.emph{padding:12px;border-radius:var(--radius-sm);border:1px solid transparent;gap:14px;background:rgba(255,255,255,.06);box-shadow:inset 0 1px 0 rgba(255,255,255,.08)}
+.r.emph .k{font-size:13px;color:rgba(200,203,224,.85)}
+.r.emph .v{font-size:22px}
+.r.emph.danger{border-color:rgba(255,107,107,.45);background:linear-gradient(180deg,rgba(255,107,107,.16),rgba(255,107,107,.08))}
+.r.emph.danger .v{color:var(--danger)}
+.r.emph.success{border-color:rgba(134,247,194,.45);background:linear-gradient(180deg,rgba(134,247,194,.2),rgba(134,247,194,.08))}
+.r.emph.success .v{color:var(--accent-2)}
+.r.emph.success.negative{border-color:rgba(255,107,107,.45);background:linear-gradient(180deg,rgba(255,107,107,.16),rgba(255,107,107,.08))}
+.r.emph.success.negative .v{color:var(--danger)}
 .r.total{padding-top:8px;margin-top:6px;border-top:1px dashed var(--stroke)}
+#sFinal{font-size:22px}
 .badge{font-size:12px;color:#0b1a13;font-weight:800;background:linear-gradient(180deg,#86f7c2,#4fe2a3);padding:6px 10px;border-radius:999px}
 .muted{color:var(--muted)}
 .uploadRow{align-items:center}

@@ -55,6 +55,7 @@ function toNumber(str){
 }
 const fmtBRL = n => new Intl.NumberFormat('pt-BR',{style:'currency',currency:'BRL'}).format(isFinite(n)?n:0);
 const clamp = (v,min,max)=>Math.min(Math.max(v,min),max);
+const FIXED_ENERGY_FEE = 30;
 
 /* ==========================
    Elementos principais
@@ -98,11 +99,27 @@ function getDecimalCount(raw){
   return match ? match[1].length : 0;
 }
 
-function scorePriceCandidate(candidate, { distance = 0, fromLabel = false, hasCurrency = false, sequenceIndex = 0 } = {}){
+function isProbableUnitPrice(candidate){
+  if (!candidate || !isFinite(candidate.value)) return false;
+  const value = candidate.value;
+  if (value <= 0) return false;
+  if (value >= 15) return false;
+  if (value < 0.05) return false;
+  const decimals = getDecimalCount(candidate.raw);
+  if (decimals >= 4) return true;
+  if (value < 2 && decimals >= 2) return true;
+  if (value < 5 && decimals >= 3) return true;
+  if (value < 3 && decimals >= 2) return true;
+  return false;
+}
+
+function scorePriceCandidate(candidate, { distance = 0, fromLabel = false, hasCurrency = false, sequenceIndex = 0, isPriceLabel = false, isTarifa = false } = {}){
   if (!candidate || !isFinite(candidate.value)) return -Infinity;
   const decimals = getDecimalCount(candidate.raw);
   let score = 0;
   if (fromLabel) score += 60;
+  if (isPriceLabel) score += 45;
+  if (isTarifa) score -= 55;
   if (hasCurrency) score += 15;
   if (decimals >= 4) score += 30;
   else if (decimals === 3) score += 18;
@@ -111,6 +128,7 @@ function scorePriceCandidate(candidate, { distance = 0, fromLabel = false, hasCu
   else if (candidate.value >= 5 && candidate.value < 10) score += 12;
   else if (candidate.value >= 10 && candidate.value < 20) score -= 12;
   else if (candidate.value >= 20) score -= 45;
+  if (!isProbableUnitPrice(candidate) && !hasCurrency) score -= 40;
   score -= distance * 1.5;
   score -= sequenceIndex * 0.1;
   return score;
@@ -398,38 +416,85 @@ async function extractBillValues(file){
     const priceCandidates = [];
     const maxIndex = Math.min(tokenData.length, referenceIndex + 80);
 
+    const computeContextFlags = (position) => {
+      const windowStart = Math.max(0, position - 4);
+      const contextTokens = tokenData.slice(windowStart, Math.min(tokenData.length, position + 1));
+      const contextText = contextTokens.map(t => t.upperNormalized).join(' ');
+      return {
+        hasPriceLabel: contextText.includes('PRECO') && contextText.includes('UNIT'),
+        hasTarifaLabel: contextText.includes('TARIFA')
+      };
+    };
+
     const pushCandidate = (number, index, opts = {}) => {
       if (!number || !isFinite(number.value) || number.value <= 0) return;
       if (kwhCandidate && number.value === kwhCandidate.value && Math.abs(index - kwhTokenIndex) <= 1) return;
       const distance = Math.abs(index - referenceIndex);
+      const { hasPriceLabel, hasTarifaLabel } = opts.hasPriceLabel === undefined && opts.hasTarifaLabel === undefined
+        ? computeContextFlags(index)
+        : { hasPriceLabel: !!opts.hasPriceLabel, hasTarifaLabel: !!opts.hasTarifaLabel };
       priceCandidates.push({
         number,
         index,
         distance,
         fromLabel: !!opts.fromLabel,
-        hasCurrency: !!opts.hasCurrency
+        hasCurrency: !!opts.hasCurrency,
+        hasPriceLabel,
+        hasTarifaLabel
       });
     };
 
     if (kwhTokenIndex !== -1){
-      for (let i = kwhTokenIndex + 1; i < tokenData.length && i <= kwhTokenIndex + 12; i++){
+      const adjacencyCandidates = [];
+      for (let i = kwhTokenIndex + 1; i < tokenData.length && i <= kwhTokenIndex + 16; i++){
         const token = tokenData[i];
         const normalized = token.upperNormalized;
         const number = findNumberInText(token.raw);
         if (!number) continue;
-        if (number.value === kwhCandidate?.value) continue;
+        if (Math.abs(number.value - (kwhCandidate?.value ?? NaN)) < 1e-6) continue;
         if (number.value <= 0) continue;
         if (number.value >= 20) continue;
         const hasCurrency = token.raw.includes('R$') || normalized.includes('RS');
-        const decimals = getDecimalCount(number.raw);
-        const looksLikeUnitPrice = hasCurrency || decimals >= 3 || number.value < 5;
-        if (looksLikeUnitPrice){
-          priceCandidate = number;
-          break;
+        const contextTokens = tokenData.slice(Math.max(kwhTokenIndex + 1, i - 4), i + 1);
+        const contextText = contextTokens.map(t => t.upperNormalized).join(' ');
+        const hasPriceLabel = contextText.includes('PRECO') && contextText.includes('UNIT');
+        const hasTarifaLabel = contextText.includes('TARIFA');
+        const candidateInfo = {
+          number,
+          index: i,
+          hasCurrency,
+          hasPriceLabel,
+          hasTarifaLabel
+        };
+        if (hasPriceLabel || hasCurrency || isProbableUnitPrice(number)){
+          adjacencyCandidates.push(candidateInfo);
+        } else if (!hasTarifaLabel && number.value < 10){
+          adjacencyCandidates.push({ ...candidateInfo, weak: true });
         }
-        if (!priceCandidate && number.value < 5){
-          priceCandidate = number;
-          break;
+      }
+      if (adjacencyCandidates.length){
+        const highPrecision = adjacencyCandidates.filter(candidate =>
+          getDecimalCount(candidate.number.raw) >= 5 && !candidate.hasTarifaLabel
+        );
+        if (highPrecision.length){
+          priceCandidate = highPrecision[0].number;
+        } else {
+          const priceLabelCandidate = adjacencyCandidates.find(candidate =>
+            candidate.hasPriceLabel && !candidate.hasTarifaLabel && isProbableUnitPrice(candidate.number)
+          );
+          if (priceLabelCandidate){
+            priceCandidate = priceLabelCandidate.number;
+          } else {
+            const filtered = adjacencyCandidates.filter(candidate =>
+              !candidate.hasTarifaLabel && isProbableUnitPrice(candidate.number)
+            );
+            if (filtered.length){
+              priceCandidate = filtered[0].number;
+            } else {
+              const firstValid = adjacencyCandidates.find(candidate => !candidate.hasTarifaLabel) || adjacencyCandidates[0];
+              if (firstValid) priceCandidate = firstValid.number;
+            }
+          }
         }
       }
     }
@@ -446,7 +511,7 @@ async function extractBillValues(file){
           for (let j = i + 1; j < tokenData.length && j <= i + 6; j++){
             const lookahead = findNumberInText(tokenData[j].raw);
             const lookaheadCurrency = tokenData[j].raw.includes('R$') || tokenData[j].upperNormalized.includes('RS');
-            pushCandidate(lookahead, j, { fromLabel: true, hasCurrency: lookaheadCurrency });
+            pushCandidate(lookahead, j, { fromLabel: true, hasCurrency: lookaheadCurrency, hasPriceLabel: true });
           }
         }
 
@@ -460,7 +525,9 @@ async function extractBillValues(file){
             distance: candidate.distance,
             fromLabel: candidate.fromLabel,
             hasCurrency: candidate.hasCurrency,
-            sequenceIndex: seqIdx
+            sequenceIndex: seqIdx,
+            isPriceLabel: candidate.hasPriceLabel,
+            isTarifa: candidate.hasTarifaLabel
           });
           if (!best || score > best.score || (score === best.score && candidate.distance < best.distance)){
             best = { ...candidate, score };
@@ -474,6 +541,38 @@ async function extractBillValues(file){
   const normalized = normalizeAccents(rawText);
   const upper = rawText.toUpperCase();
   const upperNormalized = normalized.toUpperCase();
+
+  const computeGlobalCandidateScore = (candidate) => {
+    if (!candidate || !isFinite(candidate.value)){
+      return { score: -Infinity, hasCurrency: false, isPriceLabel: false, isTarifa: false };
+    }
+    const rawCandidate = candidate.raw;
+    let base = rawText;
+    let baseUpper = upper;
+    let idx = base.indexOf(rawCandidate);
+    if (idx === -1){
+      base = normalized;
+      baseUpper = upperNormalized;
+      idx = base.indexOf(rawCandidate);
+    }
+    if (idx === -1){
+      return { score: scorePriceCandidate(candidate, { distance: 3, sequenceIndex: 9 }), hasCurrency: false, isPriceLabel: false, isTarifa: false };
+    }
+    const contextStart = Math.max(0, idx - 120);
+    const contextEnd = Math.min(base.length, idx + rawCandidate.length + 120);
+    const contextUpper = baseUpper.slice(contextStart, contextEnd);
+    const hasCurrency = contextUpper.includes('R$') || contextUpper.includes('RS');
+    const isPriceLabel = contextUpper.includes('PRECO') && contextUpper.includes('UNIT');
+    const isTarifa = contextUpper.includes('TARIFA');
+    const score = scorePriceCandidate(candidate, {
+      distance: 0,
+      sequenceIndex: 0,
+      hasCurrency,
+      isPriceLabel,
+      isTarifa
+    });
+    return { score, hasCurrency, isPriceLabel, isTarifa };
+  };
 
   function buildSnippetFromText(){
     for (const anchor of anchors){
@@ -491,7 +590,9 @@ async function extractBillValues(file){
   }
 
   function extractFromSnippet(snippetText){
-    if (!snippetText) return { kwh: null, price: null };
+    if (!snippetText) return { kwh: null, price: null, priceMeta: null };
+    const snippetNormalized = normalizeAccents(snippetText);
+    const snippetUpper = snippetNormalized.toUpperCase();
     const numberPattern = /(\d{1,3}(?:\.\d{3})*,\d+|\d+(?:\.\d+)?)/g;
     const numberMatches = [...snippetText.matchAll(numberPattern)].map(match => ({
       raw: match[1] || match[0],
@@ -500,7 +601,7 @@ async function extractBillValues(file){
     })).filter(entry => isFinite(entry.value));
 
     const kwhFromTag = (() => {
-      const match = snippetText.match(/KWH[^\d]*([\d.,]+)/i);
+      const match = snippetUpper.match(/KWH[^\d]*([\d.,]+)/i);
       if (!match) return null;
       return { raw: match[1], value: toNumber(match[1]) };
     })();
@@ -511,48 +612,133 @@ async function extractBillValues(file){
     }
 
     let price = null;
+    let priceMeta = null;
     if (kwh){
       const idx = numberMatches.findIndex(entry => entry.raw === kwh.raw || entry.value === kwh.value);
       if (idx !== -1){
         const after = numberMatches.slice(idx + 1);
-        if (after.length){
-          let best = null;
-          after.forEach((entry, seqIdx) => {
-            const score = scorePriceCandidate(entry, { distance: seqIdx + 1, sequenceIndex: seqIdx });
-            if (!best || score > best.score){
-              best = { entry, score };
+        const ordered = after.map((entry, seqIdx) => {
+          const contextStart = Math.max(0, entry.index - 60);
+          const contextEnd = Math.min(snippetUpper.length, entry.index + (entry.raw?.length || 0) + 60);
+          const context = snippetUpper.slice(contextStart, contextEnd);
+          const hasTarifaContext = context.includes('TARIFA');
+          const hasPriceContext = context.includes('PRECO') && context.includes('UNIT');
+          const hasCurrencyContext = context.includes('R$') || context.includes('RS');
+          return {
+            entry,
+            seqIdx,
+            hasTarifaContext,
+            hasPriceContext,
+            hasCurrencyContext,
+            distance: seqIdx + 1
+          };
+        });
+
+        const preferred = ordered.find(candidate =>
+          candidate && candidate.hasPriceContext && !candidate.hasTarifaContext && isProbableUnitPrice(candidate.entry)
+        );
+        if (preferred){
+          price = preferred.entry;
+          priceMeta = {
+            hasPriceLabel: preferred.hasPriceContext,
+            hasTarifaLabel: preferred.hasTarifaContext,
+            hasCurrency: preferred.hasCurrencyContext,
+            sequenceIndex: preferred.seqIdx,
+            source: 'preferred'
+          };
+        } else {
+          const viable = ordered.find(candidate =>
+            candidate && !candidate.hasTarifaContext && isProbableUnitPrice(candidate.entry)
+          );
+          if (viable){
+            price = viable.entry;
+            priceMeta = {
+              hasPriceLabel: viable.hasPriceContext,
+              hasTarifaLabel: viable.hasTarifaContext,
+              hasCurrency: viable.hasCurrencyContext,
+              sequenceIndex: viable.seqIdx,
+              source: 'adjacent'
+            };
+          } else {
+            let best = null;
+            ordered.forEach(candidate => {
+              const score = scorePriceCandidate(candidate.entry, {
+                distance: candidate.distance,
+                sequenceIndex: candidate.seqIdx,
+                isPriceLabel: candidate.hasPriceContext,
+                isTarifa: candidate.hasTarifaContext,
+                hasCurrency: candidate.hasCurrencyContext
+              });
+              if (!best || score > best.score){
+                best = { entry: candidate.entry, score, meta: candidate };
+              }
+            });
+            if (best){
+              price = best.entry;
+              priceMeta = {
+                hasPriceLabel: best.meta?.hasPriceContext,
+                hasTarifaLabel: best.meta?.hasTarifaContext,
+                hasCurrency: best.meta?.hasCurrencyContext,
+                sequenceIndex: best.meta?.seqIdx,
+                source: 'scored'
+              };
             }
-          });
-          if (best) price = best.entry;
+          }
         }
       }
     }
     if (!price){
-      const match = snippetText.match(/(?:PRE[CÇ]O\s*UNIT[^\d]*|R\$[^\d]*)\s*([\d.,]+)/i);
+      const match = snippetUpper.match(/(?:PRECO\s*UNIT[^\d]*|R\$[^\d]*)\s*([\d.,]+)/i);
       if (match){
         const value = toNumber(match[1]);
-        if (isFinite(value)) price = { raw: match[1], value };
+        if (isFinite(value)){
+          const candidate = { raw: match[1], value };
+          if (isProbableUnitPrice(candidate)){
+            price = candidate;
+            priceMeta = { hasPriceLabel: true, hasTarifaLabel: false, hasCurrency: true, source: 'regex' };
+          }
+        }
       }
     }
     if (!price){
       let best = null;
       numberMatches.forEach((entry, seqIdx) => {
-        const score = scorePriceCandidate(entry, { distance: seqIdx + 1, sequenceIndex: seqIdx });
+        const contextStart = Math.max(0, entry.index - 40);
+        const contextEnd = Math.min(snippetUpper.length, entry.index + (entry.raw?.length || 0) + 40);
+        const context = snippetUpper.slice(contextStart, contextEnd);
+        const score = scorePriceCandidate(entry, {
+          distance: seqIdx + 1,
+          sequenceIndex: seqIdx,
+          isPriceLabel: context.includes('PRECO') && context.includes('UNIT'),
+          isTarifa: context.includes('TARIFA'),
+          hasCurrency: context.includes('R$') || context.includes('RS')
+        });
         if (!best || score > best.score){
-          best = { entry, score };
+          best = { entry, score, context };
         }
       });
-      if (best) price = best.entry;
+      if (best && isProbableUnitPrice(best.entry)){
+        price = best.entry;
+        priceMeta = {
+          hasPriceLabel: best.context.includes('PRECO') && best.context.includes('UNIT'),
+          hasTarifaLabel: best.context.includes('TARIFA'),
+          hasCurrency: best.context.includes('R$') || best.context.includes('RS'),
+          source: 'fallback'
+        };
+      }
     }
 
-    return { kwh, price };
+    if (price && !isProbableUnitPrice(price)) price = null;
+
+    return { kwh, price, priceMeta };
   }
 
+  const needSnippet = !kwhCandidate || !priceCandidate;
   let snippet = snippetFromTokens;
-  if ((!kwhCandidate || !priceCandidate) && !snippet){
+  if ((!snippet || !snippet.trim()) && needSnippet){
     snippet = buildSnippetFromText();
   }
-  if ((!kwhCandidate || !priceCandidate) && !snippet){
+  if ((!snippet || !snippet.trim()) && needSnippet){
     const fallbackMatch = rawText.match(/KWH[^\d]*[\d.,]+/i);
     if (fallbackMatch){
       const idx = fallbackMatch.index ?? rawText.indexOf(fallbackMatch[0]);
@@ -561,14 +747,34 @@ async function extractBillValues(file){
     }
   }
 
-  if ((!kwhCandidate || !priceCandidate) && !snippet){
+  if ((!snippet || !snippet.trim()) && needSnippet){
     throw new Error('Não foi possível localizar os campos de crédito no PDF. Informe os valores manualmente ou envie o arquivo completo.');
   }
 
-  if (!kwhCandidate || !priceCandidate){
-    const { kwh: snippetKwh, price: snippetPrice } = extractFromSnippet(snippet);
-    if (!kwhCandidate && snippetKwh) kwhCandidate = snippetKwh;
-    if (!priceCandidate && snippetPrice) priceCandidate = snippetPrice;
+  const snippetExtraction = snippet ? extractFromSnippet(snippet) : { kwh: null, price: null, priceMeta: null };
+  if (!kwhCandidate && snippetExtraction.kwh) kwhCandidate = snippetExtraction.kwh;
+
+  const snippetPriceCandidate = snippetExtraction.price && isProbableUnitPrice(snippetExtraction.price)
+    ? snippetExtraction.price
+    : null;
+
+  if (snippetPriceCandidate){
+    const snippetScoreLocal = scorePriceCandidate(snippetPriceCandidate, {
+      distance: snippetExtraction.priceMeta?.sequenceIndex ?? 0,
+      sequenceIndex: snippetExtraction.priceMeta?.sequenceIndex ?? 0,
+      fromLabel: snippetExtraction.priceMeta?.source === 'regex',
+      hasCurrency: !!snippetExtraction.priceMeta?.hasCurrency,
+      isPriceLabel: !!snippetExtraction.priceMeta?.hasPriceLabel,
+      isTarifa: !!snippetExtraction.priceMeta?.hasTarifaLabel
+    });
+    const snippetScoreGlobal = computeGlobalCandidateScore(snippetPriceCandidate).score;
+    const snippetScore = Math.max(snippetScoreLocal, snippetScoreGlobal);
+    const currentScore = computeGlobalCandidateScore(priceCandidate).score;
+    if (!priceCandidate || snippetScore > currentScore){
+      priceCandidate = snippetPriceCandidate;
+    }
+  } else if (!priceCandidate && snippetExtraction.price){
+    priceCandidate = snippetExtraction.price;
   }
 
   if (!kwhCandidate){
@@ -621,6 +827,10 @@ const sInj = document.getElementById('sInj');
 const sUnit = document.getElementById('sUnit');
 const sPct = document.getElementById('sPct');
 const sFinal = document.getElementById('sFinal');
+const sUtility = document.getElementById('sUtility');
+const sSavings = document.getElementById('sSavings');
+const utilityRow = document.getElementById('utilityRow');
+const savingsRow = document.getElementById('savingsRow');
 
 const calcBtn = document.getElementById('calcBtn');
 const clearBtn = document.getElementById('clearBtn');
@@ -745,12 +955,17 @@ function calculate(){
     resBox.hidden = true;
     if (inj.value || unit.value) err.classList.add('show');
     sInj.textContent = '—'; sUnit.textContent = '—'; sPct.textContent = '—'; sFinal.textContent = fmtBRL(0);
+    if (sUtility) sUtility.textContent = fmtBRL(0);
+    if (sSavings) sSavings.textContent = fmtBRL(0);
+    if (savingsRow) savingsRow.classList.remove('negative');
     return;
   }
 
   const base = nInj * nUnit;
   const desc = base * (pct/100);
   const final = base - desc;
+  const utilityCost = base + FIXED_ENERGY_FEE;
+  const savingsValue = utilityCost - final;
 
   vBase.textContent = fmtBRL(base);
   vPct.textContent = `${pct.toLocaleString('pt-BR')}%`;
@@ -761,6 +976,9 @@ function calculate(){
   sUnit.textContent = `${fmtBRL(nUnit)} / kWh`;
   sPct.textContent = `${pct.toLocaleString('pt-BR')}%`;
   sFinal.textContent = fmtBRL(final);
+  if (sUtility) sUtility.textContent = fmtBRL(utilityCost);
+  if (sSavings) sSavings.textContent = fmtBRL(savingsValue);
+  if (savingsRow) savingsRow.classList.toggle('negative', savingsValue < 0);
 
   resBox.hidden = false;
 
@@ -785,6 +1003,9 @@ clearBtn.addEventListener('click', ()=>{
   syncChips(); showAllDiscounts();
   err.classList.remove('show'); resBox.hidden=true;
   sInj.textContent='—'; sUnit.textContent='—'; sPct.textContent='—'; sFinal.textContent=fmtBRL(0);
+  if (sUtility) sUtility.textContent = fmtBRL(0);
+  if (sSavings) sSavings.textContent = fmtBRL(0);
+  if (savingsRow) savingsRow.classList.remove('negative');
   qrcodeBox.innerHTML=''; qrArea.classList.add('hidden'); qrPayload.value='';
   if (billInput) billInput.value='';
   if (billFileName) billFileName.textContent='Nenhum arquivo selecionado';
